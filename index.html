@@ -1,0 +1,2190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Mushroom Mini-Golf</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #10121b;
+    background-image: radial-gradient(circle at 50% 0%, #1e2440 0%, #10121b 70%);
+    overflow: hidden;
+    font-family: "Trebuchet MS", "Verdana", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    display: block;
+    /* 960x600 letterboxed into whatever the window is, never overflowing it */
+    width: min(100vw, calc(100vh * 1.6));
+    height: min(62.5vw, 100vh);
+    touch-action: none;
+    cursor: crosshair;
+    border-radius: 10px;
+    box-shadow: 0 18px 60px rgba(0,0,0,.6);
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="600" aria-label="Mushroom Mini-Golf"></canvas></div>
+<script>
+"use strict";
+
+/* ============================================================================
+ * MUSHROOM MINI-GOLF
+ * A top-down mini-golf game with playful booby traps, built for small children.
+ *
+ * Design rules baked in everywhere:
+ *   - No timers, no lives, no losing. Unlimited strokes.
+ *   - The worst thing that can happen is +1 stroke and a friendly reset.
+ *   - Every message is encouraging.
+ *   - Retry and Skip are always one big button away.
+ *
+ * All art is drawn with canvas primitives. No images, no sound files,
+ * no dependencies, no network. One file, double-click to play.
+ * ==========================================================================*/
+
+
+/* ============================================================================
+ * 1. CONFIG & CONSTANTS
+ * ==========================================================================*/
+
+const W = 960, H = 600;          // logical resolution; CSS scales it to fit
+const HUD_H = 56;                // top bar reserved for the scoreboard
+const WALL_T = 16;               // thickness of the automatic boundary walls
+
+const BALL_R      = 9;
+const CUP_R       = 14;
+const MAX_DRAG    = 190;         // pixels of pull-back that equals full power
+const MAX_SPEED   = 1000;        // px/sec at full power
+const MIN_POWER   = 0.045;       // below this a drag is treated as a mis-tap
+const REST_SPEED  = 11;          // below this the ball is considered stopped
+const SINK_SPEED  = 330;         // faster than this and the ball lips out
+const WALL_BOUNCE = 0.70;
+
+const FIXED_DT    = 1 / 120;     // physics timestep
+const MAX_FRAME   = 0.25;        // clamp after a tab switch
+
+// Per-surface rolling resistance. `damp` is exponential, `decel` is linear;
+// together they give a roll that slows convincingly and then actually stops.
+const SURFACES = {
+  grass: { damp: 0.95, decel: 34,  color: null },
+  sand:  { damp: 5.20, decel: 250, color: '#e6cf8e' },
+  mud:   { damp: 8.00, decel: 430, color: '#6d4a2f' },
+  ice:   { damp: 0.10, decel: 2,   color: '#cfe9ff' },
+  water: { damp: 6.00, decel: 200, color: '#2f86e0' }
+};
+
+const PALETTE = {
+  grassA: '#3fa94a', grassB: '#48b854',
+  brick:  '#c8642a', brickDark: '#8d3f16', brickLite: '#e2854a',
+  stone:  '#8e93a8', stoneDark: '#5d6376', stoneLite: '#b6bbcd',
+  hedge:  '#2f7d3a', hedgeDark: '#1f5b28', hedgeLite: '#4a9c55',
+  pipe:   '#2fb34a', pipeDark: '#166b28', pipeLite: '#6fe07f',
+  ink:    '#20242e'
+};
+
+const COURSE_NAME = 'Mushroom Cup';
+
+
+/* ============================================================================
+ * 2. MATH & SMALL UTILITIES
+ * ==========================================================================*/
+
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const len   = (x, y) => Math.hypot(x, y);
+const TAU   = Math.PI * 2;
+
+/** Deterministic pseudo-random so decorative speckles never flicker. */
+function seeded(seed) {
+  let s = seed >>> 0 || 1;
+  return function () {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >> 17;
+    s ^= s << 5;  s >>>= 0;
+    return s / 4294967296;
+  };
+}
+
+function pointInRect(x, y, r) {
+  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+
+
+/* ============================================================================
+ * 3. AUDIO — everything synthesised, so there are no asset files
+ * ==========================================================================*/
+
+const Sound = {
+  ctx: null,
+  on: true,
+
+  /** Browsers require a user gesture before audio can start. */
+  init() {
+    if (this.ctx) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) this.ctx = new AC();
+    } catch (e) { this.ctx = null; }
+  },
+
+  ready() {
+    if (!this.on || !this.ctx) return false;
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    return true;
+  },
+
+  tone(freq, dur, opts) {
+    if (!this.ready()) return;
+    opts = opts || {};
+    const t0 = this.ctx.currentTime + (opts.delay || 0);
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = opts.type || 'square';
+    osc.frequency.setValueAtTime(freq, t0);
+    if (opts.slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(20, opts.slideTo), t0 + dur);
+    const vol = (opts.gain == null ? 0.16 : opts.gain);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.03);
+  },
+
+  noise(dur, opts) {
+    if (!this.ready()) return;
+    opts = opts || {};
+    const t0 = this.ctx.currentTime + (opts.delay || 0);
+    const n = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const flt = this.ctx.createBiquadFilter();
+    flt.type = opts.highpass ? 'highpass' : 'lowpass';
+    flt.frequency.value = opts.freq || 900;
+    const gain = this.ctx.createGain();
+    gain.gain.value = opts.gain == null ? 0.18 : opts.gain;
+    src.connect(flt).connect(gain).connect(this.ctx.destination);
+    src.start(t0);
+  },
+
+  putt(power)  { this.tone(300 + power * 420, 0.09, { type: 'square', gain: 0.13, slideTo: 200 + power * 300 }); },
+  bonk()       { this.tone(180, 0.07, { type: 'square', gain: 0.10, slideTo: 120 }); },
+  boing()      { this.tone(420, 0.16, { type: 'triangle', gain: 0.15, slideTo: 900 }); },
+  coin()       { this.tone(988, 0.07, { type: 'square', gain: 0.13 });
+                 this.tone(1319, 0.20, { type: 'square', gain: 0.13, delay: 0.07 }); },
+  warp()       { this.tone(900, 0.30, { type: 'sine', gain: 0.16, slideTo: 180 });
+                 this.tone(450, 0.30, { type: 'square', gain: 0.06, slideTo: 90 }); },
+  splash()     { this.noise(0.35, { freq: 1400, gain: 0.14 });
+                 this.tone(500, 0.22, { type: 'sine', gain: 0.10, slideTo: 160 }); },
+  thwomp()     { this.tone(90, 0.28, { type: 'square', gain: 0.20, slideTo: 45 });
+                 this.noise(0.22, { freq: 400, gain: 0.20 }); },
+  chomp()      { this.tone(150, 0.08, { type: 'sawtooth', gain: 0.14, slideTo: 70 });
+                 this.tone(150, 0.08, { type: 'sawtooth', gain: 0.14, slideTo: 70, delay: 0.10 }); },
+  slip()       { this.tone(700, 0.22, { type: 'sine', gain: 0.12, slideTo: 250 }); },
+  sink()       { [523, 659, 784, 1047].forEach((f, i) =>
+                   this.tone(f, 0.16, { type: 'square', gain: 0.14, delay: i * 0.075 })); },
+  fanfare()    { [523, 523, 523, 659, 784, 659, 784, 1047].forEach((f, i) =>
+                   this.tone(f, 0.24, { type: 'square', gain: 0.13, delay: i * 0.13 })); },
+  click()      { this.tone(660, 0.06, { type: 'square', gain: 0.10 }); }
+};
+
+
+/* ============================================================================
+ * 4. LEVEL DATA — nine holes, each introducing exactly one new idea.
+ *
+ * Coordinates live inside the play field: x 16..944, y 72..584.
+ * Every level automatically gets solid boundary walls, so the ball can
+ * never leave the course.
+ *
+ * Trap shapes:
+ *   goomba  {x,y,x2,y2,speed}          patrols between (x,y) and (x2,y2)
+ *   pipes   {x,y,x2,y2}                a linked pair of warp pipes
+ *   thwomp  {x,y,size,period,phase}    slams down on a timer
+ *   piranha {x,y,period,phase}         pops out of a pipe mouth
+ *   bumper  {x,y,r}                    springy ? block
+ *   banana  {x,y}                      one-shot spin-out
+ *   boost   {x,y,w,h,dx,dy,power}      conveyor arrows
+ *   chomp   {x,y,cx,cy,range}          chained guard dog; (cx,cy) is its post
+ * ==========================================================================*/
+
+const LEVELS = [
+  {
+    name: 'Warm-Up Green', par: 2, wallStyle: 'brick',
+    tee: { x: 160, y: 330 }, cup: { x: 800, y: 330 },
+    walls: [], surfaces: [], traps: [],
+    decor: [ {t:'bush',x:150,y:150}, {t:'bush',x:820,y:520}, {t:'flower',x:420,y:180},
+             {t:'flower',x:560,y:470}, {t:'flower',x:300,y:520} ],
+    hint: 'Pull back from the ball, then let go!'
+  },
+
+  {
+    name: 'Doughnut Bend', par: 3, wallStyle: 'brick',
+    tee: { x: 130, y: 505 }, cup: { x: 838, y: 175 },
+    walls: [ { x: 250, y: 72, w: 450, h: 340 } ],
+    surfaces: [], traps: [],
+    decor: [ {t:'flower',x:150,y:200}, {t:'flower',x:180,y:420}, {t:'bush',x:790,y:520} ],
+    hint: 'Bounce off the walls to get around!'
+  },
+
+  {
+    name: 'Goomba Stroll', par: 3, wallStyle: 'brick',
+    tee: { x: 120, y: 330 }, cup: { x: 858, y: 330 },
+    walls: [ { x: 500, y: 72,  w: 24, h: 130 },
+             { x: 500, y: 454, w: 24, h: 130 } ],
+    surfaces: [],
+    traps: [
+      { t: 'goomba', x: 380, y: 150, x2: 380, y2: 510, speed: 95 },
+      { t: 'goomba', x: 650, y: 510, x2: 650, y2: 150, speed: 130 }
+    ],
+    decor: [ {t:'bush',x:230,y:130}, {t:'bush',x:230,y:530}, {t:'flower',x:760,y:180} ],
+    hint: 'Goombas are bouncy — they cannot hurt you!'
+  },
+
+  {
+    name: 'Pipe Dreams', par: 3, wallStyle: 'brick',
+    tee: { x: 140, y: 480 }, cup: { x: 840, y: 470 },
+    walls: [ { x: 466, y: 72, w: 28, h: 512 },
+             { x: 620, y: 250, w: 240, h: 24 } ],
+    surfaces: [],
+    traps: [ { t: 'pipes', x: 260, y: 460, x2: 690, y2: 160 } ],
+    decor: [ {t:'flower',x:160,y:180}, {t:'flower',x:350,y:250}, {t:'bush',x:880,y:150} ],
+    hint: 'Roll into the pipe to warp across!'
+  },
+
+  {
+    name: 'Sandy Shores', par: 3, wallStyle: 'brick',
+    tee: { x: 120, y: 520 }, cup: { x: 848, y: 150 },
+    walls: [ { x: 250, y: 72, w: 24, h: 180 } ],
+    surfaces: [
+      { type: 'sand',  x: 300, y: 300, w: 230, h: 170 },
+      { type: 'sand',  x: 620, y: 300, w: 170, h: 130 },
+      { type: 'water', x: 380, y: 90,  w: 200, h: 160 }
+    ],
+    traps: [],
+    decor: [ {t:'bush',x:700,y:520}, {t:'flower',x:180,y:330} ],
+    hint: 'Sand is slow and water costs one shot.'
+  },
+
+  {
+    name: 'Bumper Bash', par: 3, wallStyle: 'brick',
+    tee: { x: 120, y: 330 }, cup: { x: 862, y: 330 },
+    walls: [],
+    surfaces: [],
+    traps: [
+      { t: 'boost',  x: 200, y: 295, w: 130, h: 70, dx: 1, dy: 0, power: 950 },
+      { t: 'bumper', x: 420, y: 200, r: 26 },
+      { t: 'bumper', x: 420, y: 460, r: 26 },
+      { t: 'bumper', x: 580, y: 330, r: 30 },
+      { t: 'bumper', x: 730, y: 190, r: 24 },
+      { t: 'bumper', x: 730, y: 470, r: 24 }
+    ],
+    decor: [ {t:'flower',x:150,y:150}, {t:'flower',x:150,y:520} ],
+    hint: 'Arrows speed you up. Blocks bounce you around!'
+  },
+
+  {
+    name: 'Thwomp Alley', par: 4, wallStyle: 'stone',
+    tee: { x: 110, y: 335 }, cup: { x: 860, y: 335 },
+    // A Thwomp leaves a 30px gap top and bottom: threadable if you are brave,
+    // but easier to just wait. A child is never hard-blocked, and there is
+    // always room for the ball to pop out from under a stone.
+    walls: [ { x: 190, y: 72,  w: 620, h: 183 },
+             { x: 190, y: 415, w: 620, h: 169 } ],
+    surfaces: [],
+    traps: [
+      { t: 'thwomp', x: 370, y: 335, size: 100, period: 2.6, phase: 0.0 },
+      { t: 'thwomp', x: 630, y: 335, size: 100, period: 2.6, phase: 1.3 }
+    ],
+    decor: [ {t:'bush',x:110,y:150}, {t:'bush',x:110,y:520},
+             {t:'bush',x:880,y:150}, {t:'bush',x:880,y:520} ],
+    hint: 'Wait for the stones to lift, then go!'
+  },
+
+  {
+    name: 'Slippery Slopes', par: 4, wallStyle: 'brick',
+    tee: { x: 120, y: 510 }, cup: { x: 858, y: 140 },
+    walls: [ { x: 300, y: 300, w: 220, h: 24 } ],
+    surfaces: [ { type: 'ice', x: 210, y: 110, w: 520, h: 410 } ],
+    traps: [
+      { t: 'banana', x: 350, y: 430 },
+      { t: 'banana', x: 480, y: 200 },
+      { t: 'banana', x: 620, y: 420 },
+      { t: 'banana', x: 660, y: 190 },
+      { t: 'boost',  x: 786, y: 290, w: 130, h: 230, dx: 0, dy: -1, power: 700 }
+    ],
+    decor: [ {t:'flower',x:140,y:200}, {t:'bush',x:150,y:330} ],
+    hint: 'Ice is slippy — use gentle taps!'
+  },
+
+  {
+    name: 'Castle Finale', par: 4, wallStyle: 'stone',
+    tee: { x: 110, y: 520 }, cup: { x: 838, y: 150 },
+    walls: [
+      { x: 250, y: 300, w: 300, h: 24 },
+      { x: 640, y: 330, w: 24,  h: 254 },
+      { x: 250, y: 120, w: 24,  h: 120 }
+    ],
+    surfaces: [ { type: 'mud',   x: 300, y: 400, w: 180, h: 150 },
+                { type: 'water', x: 380, y: 90,  w: 150, h: 130 } ],
+    traps: [
+      { t: 'pipes',   x: 170, y: 200, x2: 720, y2: 500 },
+      { t: 'piranha', x: 600, y: 150, period: 3.0, phase: 0.6 },
+      { t: 'thwomp',  x: 560, y: 430, size: 88, period: 2.2, phase: 0.4 },
+      { t: 'bumper',  x: 760, y: 330, r: 26 },
+      { t: 'banana',  x: 560, y: 200 },
+      { t: 'chomp',   x: 780, y: 230, cx: 780, cy: 235, range: 150 }
+    ],
+    decor: [ {t:'bush',x:120,y:120}, {t:'bush',x:900,y:560}, {t:'flower',x:180,y:400} ],
+    hint: 'Everything at once. You can do it!'
+  }
+];
+
+const COURSE_PAR = LEVELS.reduce((s, l) => s + l.par, 0);
+
+
+/* ============================================================================
+ * 5. GAME STATE
+ * ==========================================================================*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const Game = {
+  screen: 'TITLE',              // TITLE | PLAYING | HOLE_DONE | COURSE_DONE
+  holeIndex: 0,
+  level: null,
+  strokes: 0,
+  scores: new Array(LEVELS.length).fill(null),
+  skipped: new Array(LEVELS.length).fill(false),
+  best: new Array(LEVELS.length).fill(null),
+  time: 0,
+  shake: 0,
+  debug: false,
+  fps: 60,
+  message: '',
+  celebrate: 0
+};
+
+const ball = {
+  x: 0, y: 0, vx: 0, vy: 0, r: BALL_R,
+  moving: false,
+  squash: 0,          // seconds left flattened by a Thwomp
+  spin: 0,            // visual roll angle
+  face: 0,            // direction the little cap points
+  sinking: 0,         // 0..1 sink animation
+  sunk: false
+};
+
+const aim = { active: false, x: 0, y: 0, power: 0, dx: 1, dy: 0 };
+
+let walls = [];        // level walls + auto boundary
+let surfaces = [];     // sand / ice / mud / water
+let traps = [];        // live trap entities
+let decor = [];
+let particles = [];
+let confetti = [];
+let floaters = [];     // rising text like "+1"
+let safeSpot = { x: 0, y: 0 };
+
+
+/* ============================================================================
+ * 6. PHYSICS
+ * ==========================================================================*/
+
+/** Resolve ball vs axis-aligned rect. Returns impact speed, or 0 for no hit. */
+function hitRect(b, r, bounce) {
+  const cx = clamp(b.x, r.x, r.x + r.w);
+  const cy = clamp(b.y, r.y, r.y + r.h);
+  let dx = b.x - cx, dy = b.y - cy;
+  let d2 = dx * dx + dy * dy;
+  if (d2 > b.r * b.r) return 0;
+
+  let d = Math.sqrt(d2), nx, ny;
+  if (d > 0.0001) {
+    nx = dx / d; ny = dy / d;
+  } else {
+    // Centre is inside the rect — eject along the shallowest face.
+    const l = b.x - r.x, ri = r.x + r.w - b.x, t = b.y - r.y, bo = r.y + r.h - b.y;
+    const m = Math.min(l, ri, t, bo);
+    if (m === l)       { nx = -1; ny = 0; }
+    else if (m === ri) { nx =  1; ny = 0; }
+    else if (m === t)  { nx = 0; ny = -1; }
+    else               { nx = 0; ny =  1; }
+    d = -m;
+  }
+  b.x += nx * (b.r - d);
+  b.y += ny * (b.r - d);
+  const vn = b.vx * nx + b.vy * ny;
+  if (vn < 0) {
+    b.vx -= (1 + bounce) * vn * nx;
+    b.vy -= (1 + bounce) * vn * ny;
+    return -vn;
+  }
+  return 0;
+}
+
+/** Resolve ball vs circle. Returns impact speed, or 0 for no hit. */
+function hitCircle(b, cx, cy, cr, bounce) {
+  let dx = b.x - cx, dy = b.y - cy;
+  let d = len(dx, dy);
+  const minD = b.r + cr;
+  if (d > minD) return 0;
+  if (d < 0.0001) { dx = 1; dy = 0; d = 0.0001; }
+  const nx = dx / d, ny = dy / d;
+  b.x = cx + nx * minD;
+  b.y = cy + ny * minD;
+  const vn = b.vx * nx + b.vy * ny;
+  if (vn < 0) {
+    b.vx -= (1 + bounce) * vn * nx;
+    b.vy -= (1 + bounce) * vn * ny;
+    return -vn;
+  }
+  return 0;
+}
+
+function surfaceAt(x, y) {
+  for (let i = 0; i < surfaces.length; i++) {
+    const s = surfaces[i];
+    if (s.type !== 'water' && pointInRect(x, y, s)) return s.type;
+  }
+  return 'grass';
+}
+
+function inWater(x, y) {
+  for (let i = 0; i < surfaces.length; i++) {
+    const s = surfaces[i];
+    if (s.type === 'water' && pointInRect(x, y, s)) return s;
+  }
+  return null;
+}
+
+function insideAnyWall(x, y, pad) {
+  pad = pad || 0;
+  for (let i = 0; i < walls.length; i++) {
+    const w = walls[i];
+    if (x > w.x - pad && x < w.x + w.w + pad && y > w.y - pad && y < w.y + w.h + pad) return true;
+  }
+  return false;
+}
+
+/** Somewhere the ball can legally sit: on land, clear of walls, in bounds. */
+function isSafeSpot(x, y) {
+  if (x < WALL_T + BALL_R || x > W - WALL_T - BALL_R) return false;
+  if (y < HUD_H + WALL_T + BALL_R || y > H - WALL_T - BALL_R) return false;
+  if (inWater(x, y)) return false;
+  if (insideAnyWall(x, y, BALL_R + 1)) return false;
+  return true;
+}
+
+/**
+ * Splash. Walk backwards along the ball's path to find the bank it came from,
+ * so the child restarts from the edge of the pond rather than all the way back.
+ */
+function splashOut() {
+  const sp = len(ball.vx, ball.vy);
+  let bx = safeSpot.x, by = safeSpot.y;
+  if (sp > 1) {
+    const ux = -ball.vx / sp, uy = -ball.vy / sp;
+    for (let d = BALL_R; d <= 260; d += 4) {
+      const px = ball.x + ux * d, py = ball.y + uy * d;
+      if (isSafeSpot(px, py)) { bx = px; by = py; break; }
+    }
+  }
+  ball.x = bx; ball.y = by;
+  ball.vx = ball.vy = 0;
+  ball.moving = false;
+  Game.strokes++;
+  Sound.splash();
+  burst(bx, by, 16, '#7ec8ff', 130);
+  addFloater(bx, by - 24, 'Splash! +1', '#8fd0ff');
+}
+
+function substep(dt) {
+  const b = ball;
+
+  // -- rolling resistance for whatever we are sitting on -------------------
+  const surf = SURFACES[surfaceAt(b.x, b.y)] || SURFACES.grass;
+  let sp = len(b.vx, b.vy);
+  if (sp > 0) {
+    let ns = Math.max(0, sp - surf.decel * dt) * Math.exp(-surf.damp * dt);
+    const k = ns / sp;
+    b.vx *= k; b.vy *= k;
+  }
+
+  // -- conveyor / boost pads ----------------------------------------------
+  for (let i = 0; i < traps.length; i++) {
+    const t = traps[i];
+    if (t.t === 'boost' && pointInRect(b.x, b.y, t)) {
+      b.vx += t.dx * t.power * dt;
+      b.vy += t.dy * t.power * dt;
+    }
+  }
+
+  // -- gentle pull into the cup when close and slow ------------------------
+  // Only while actually rolling, so a ball resting nearby is never sucked in.
+  const cup = Game.level.cup;
+  const cd = len(cup.x - b.x, cup.y - b.y);
+  sp = len(b.vx, b.vy);
+  if (cd < 46 && sp < SINK_SPEED && sp > REST_SPEED) {
+    const pull = (1 - cd / 46) * 620 * dt;
+    b.vx += (cup.x - b.x) / Math.max(cd, 0.001) * pull;
+    b.vy += (cup.y - b.y) / Math.max(cd, 0.001) * pull;
+  }
+
+  // -- speed cap then integrate -------------------------------------------
+  sp = len(b.vx, b.vy);
+  if (sp > MAX_SPEED * 1.35) { const k = MAX_SPEED * 1.35 / sp; b.vx *= k; b.vy *= k; }
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
+  b.spin += sp * dt * 0.035;
+  if (sp > 30) b.face = Math.atan2(b.vy, b.vx);
+
+  // -- walls ---------------------------------------------------------------
+  for (let i = 0; i < walls.length; i++) {
+    const impact = hitRect(b, walls[i], WALL_BOUNCE);
+    if (impact > 70) {
+      Sound.bonk();
+      burst(b.x, b.y, 3, '#ffffff', 60);
+    }
+  }
+
+  // -- traps ---------------------------------------------------------------
+  for (let i = 0; i < traps.length; i++) {
+    const t = traps[i];
+    const def = TRAP_TYPES[t.t];
+    if (def && def.collide) def.collide(t, b);
+  }
+
+  // A trap can shove the ball into a wall (a Thwomp landing beside one, a
+  // Chomp swatting it into a corner). Resolve walls again so a substep never
+  // ends with the ball buried in scenery.
+  for (let i = 0; i < walls.length; i++) hitRect(b, walls[i], WALL_BOUNCE);
+
+  // -- water ---------------------------------------------------------------
+  if (inWater(b.x, b.y)) { splashOut(); return; }
+
+  // -- the cup -------------------------------------------------------------
+  if (!b.sunk) {
+    const d = len(cup.x - b.x, cup.y - b.y);
+    const speed = len(b.vx, b.vy);
+    if (d < CUP_R - 3 && speed < SINK_SPEED) {
+      b.sunk = true; b.sinking = 0; b.vx = b.vy = 0;
+    }
+  }
+
+  // -- last-resort safety net: never let the ball escape the course --------
+  if (b.x < -20 || b.x > W + 20 || b.y < HUD_H - 20 || b.y > H + 20) {
+    b.x = safeSpot.x; b.y = safeSpot.y; b.vx = b.vy = 0;
+  }
+}
+
+function stepPhysics(dt) {
+  const b = ball;
+
+  if (b.squash > 0) { b.squash -= dt; b.vx = b.vy = 0; return; }
+  if (b.sunk) return;
+
+  // Subdivide so a full-power shot cannot tunnel through a thin wall.
+  const sp = len(b.vx, b.vy);
+  const n = clamp(Math.ceil(sp * dt / (b.r * 0.4)), 1, 12);
+  const sdt = dt / n;
+  for (let i = 0; i < n; i++) {
+    substep(sdt);
+    if (b.sunk) break;
+  }
+}
+
+
+/* ============================================================================
+ * 7. TRAPS — the booby traps. Each type owns its update, collide and draw.
+ * ==========================================================================*/
+
+const TRAP_TYPES = {
+
+  /* -- Goomba: waddles a patrol line, bounces the ball back extra hard ---- */
+  goomba: {
+    init(t) {
+      t.px = t.x; t.py = t.y;
+      t.dist = len(t.x2 - t.x, t.y2 - t.y);
+      t.ux = t.dist ? (t.x2 - t.x) / t.dist : 1;
+      t.uy = t.dist ? (t.y2 - t.y) / t.dist : 0;
+      t.travel = 0; t.dir = 1; t.r = 20; t.walk = 0; t.stun = 0;
+    },
+    update(t, dt) {
+      t.walk += dt * 7;
+      if (t.stun > 0) { t.stun -= dt; return; }
+      t.travel += t.speed * t.dir * dt;
+      if (t.travel > t.dist) { t.travel = t.dist; t.dir = -1; }
+      if (t.travel < 0)      { t.travel = 0;      t.dir =  1; }
+      t.px = t.x + t.ux * t.travel;
+      t.py = t.y + t.uy * t.travel;
+    },
+    collide(t, b) {
+      const impact = hitCircle(b, t.px, t.py, t.r, 1.30);
+      if (impact > 40) {
+        t.stun = 0.55;
+        Sound.boing();
+        burst(t.px, t.py, 8, '#f2c48b', 120);
+      }
+    },
+    draw(t) {
+      const bob = t.stun > 0 ? Math.sin(t.stun * 40) * 3 : Math.sin(t.walk) * 2;
+      const x = t.px, y = t.py + bob;
+      ctx.save();
+      shadow(x, y + 16, 20, 7);
+      // feet
+      ctx.fillStyle = '#59391d';
+      const step = Math.sin(t.walk) * 5;
+      ctx.beginPath(); ctx.ellipse(x - 9 + step, y + 15, 7, 5, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(x + 9 - step, y + 15, 7, 5, 0, 0, TAU); ctx.fill();
+      // cap
+      ctx.fillStyle = '#8b5a2b';
+      ctx.beginPath(); ctx.ellipse(x, y - 2, t.r, t.r - 1, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#a9713a';
+      ctx.beginPath(); ctx.ellipse(x, y - 6, t.r - 4, t.r - 8, 0, 0, TAU); ctx.fill();
+      // face
+      ctx.fillStyle = '#f6dfc0';
+      ctx.beginPath(); ctx.ellipse(x, y + 6, t.r - 5, 8, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = PALETTE.ink;
+      if (t.stun > 0) {
+        // dizzy little x_x eyes so it reads as "silly", never scary
+        ctx.lineWidth = 2.4; ctx.strokeStyle = PALETTE.ink;
+        [-6, 6].forEach(o => {
+          ctx.beginPath();
+          ctx.moveTo(x + o - 3, y - 1); ctx.lineTo(x + o + 3, y + 5);
+          ctx.moveTo(x + o + 3, y - 1); ctx.lineTo(x + o - 3, y + 5);
+          ctx.stroke();
+        });
+      } else {
+        ctx.beginPath(); ctx.ellipse(x - 6, y + 2, 3.2, 4.2, 0, 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(x + 6, y + 2, 3.2, 4.2, 0, 0, TAU); ctx.fill();
+        ctx.strokeStyle = PALETTE.ink; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(x, y + 6, 5, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  },
+
+  /* -- Warp pipes: a linked pair, ball keeps its speed ------------------- */
+  pipes: {
+    init(t) { t.r = 30; t.cool = 0; t.glowA = 0; t.glowB = 0; },
+    update(t, dt) {
+      t.cool = Math.max(0, t.cool - dt);
+      t.glowA = Math.max(0, t.glowA - dt * 2);
+      t.glowB = Math.max(0, t.glowB - dt * 2);
+    },
+    collide(t, b) {
+      if (t.cool > 0) return;
+      const dA = len(b.x - t.x,  b.y - t.y);
+      const dB = len(b.x - t.x2, b.y - t.y2);
+      let from = null, to = null;
+      if (dA < 18) { from = { x: t.x,  y: t.y  }; to = { x: t.x2, y: t.y2 }; t.glowB = 1; }
+      else if (dB < 18) { from = { x: t.x2, y: t.y2 }; to = { x: t.x,  y: t.y  }; t.glowA = 1; }
+      if (!from) return;
+      burst(from.x, from.y, 12, PALETTE.pipeLite, 150);
+      const sp = Math.max(len(b.vx, b.vy), 170);
+      const ang = Math.atan2(b.vy, b.vx);
+      b.x = to.x + Math.cos(ang) * (t.r + 4);
+      b.y = to.y + Math.sin(ang) * (t.r + 4);
+      b.vx = Math.cos(ang) * sp;
+      b.vy = Math.sin(ang) * sp;
+      // If the exit points straight into a wall, nudge the ball to safety.
+      if (!isSafeSpot(b.x, b.y)) {
+        for (let a = 0; a < TAU; a += 0.35) {
+          const px = to.x + Math.cos(a) * (t.r + 6), py = to.y + Math.sin(a) * (t.r + 6);
+          if (isSafeSpot(px, py)) {
+            b.x = px; b.y = py;
+            b.vx = Math.cos(a) * sp; b.vy = Math.sin(a) * sp;
+            break;
+          }
+        }
+      }
+      t.cool = 0.6;
+      Sound.warp();
+      burst(b.x, b.y, 12, PALETTE.pipeLite, 150);
+    },
+    draw(t) {
+      drawPipe(t.x,  t.y,  t.r, t.glowA);
+      drawPipe(t.x2, t.y2, t.r, t.glowB);
+    }
+  },
+
+  /* -- Thwomp: slams down on a timer, flattens the ball for a giggle ----- */
+  thwomp: {
+    init(t) {
+      t.time = t.phase || 0; t.h = 1; t.prevH = 1; t.catching = false;
+      t.up = t.period * 0.45; t.fall = 0.11; t.down = t.period * 0.32;
+      t.rise = t.period - t.up - t.fall - t.down;
+      if (t.rise < 0.2) t.rise = 0.2;
+      t.total = t.up + t.fall + t.down + t.rise;
+      t.rect = { x: t.x - t.size / 2, y: t.y - t.size / 2, w: t.size, h: t.size };
+    },
+    update(t, dt) {
+      t.prevH = t.h;
+      t.time = (t.time + dt) % t.total;
+      const u = t.time;
+      if (u < t.up)                    t.h = 1;
+      else if (u < t.up + t.fall)      t.h = 1 - (u - t.up) / t.fall;
+      else if (u < t.up + t.fall + t.down) t.h = 0;
+      else                             t.h = (u - t.up - t.fall - t.down) / t.rise;
+      t.solid = t.h < 0.28;
+
+      // The instant it commits to falling, decide whether the ball is caught.
+      // A caught ball is pinned in place so the stone can flatten it — without
+      // this it gets shoved out sideways and the whole gag never happens.
+      if (t.prevH === 1 && t.h < 1) {
+        t.catching = pointInRect(ball.x, ball.y, t.rect) && !ball.sunk && ball.squash <= 0;
+        if (t.catching) { ball.vx = 0; ball.vy = 0; }
+      }
+      if (t.h >= 1) t.catching = false;
+
+      // The moment it lands
+      if (t.prevH > 0 && t.h === 0) {
+        Sound.thwomp();
+        Game.shake = Math.max(Game.shake, 9);
+        for (let i = 0; i < 14; i++) {
+          const a = Math.random() * TAU;
+          particles.push({ x: t.x + Math.cos(a) * t.size / 2, y: t.y + Math.sin(a) * t.size / 2,
+                           vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
+                           life: 0.5, max: 0.5, c: '#d8d8e4', r: 3 });
+        }
+        // Caught underneath? Squashed flat, pops back, no penalty.
+        if (t.catching && !ball.sunk) {
+          ball.squash = 0.9; ball.vx = ball.vy = 0;
+          addFloater(ball.x, ball.y - 28, 'Squish!', '#ffd166');
+        }
+        t.catching = false;
+      }
+    },
+    collide(t, b) {
+      if (!t.solid) return;
+      if (b.squash > 0 || t.catching) return;   // a caught ball is held, not pushed
+      const impact = hitRect(b, t.rect, 0.55);
+      if (impact > 60) Sound.bonk();
+    },
+    draw(t) {
+      const s = t.size;
+      const scale = lerp(1, 1.22, t.h);            // "higher up" reads as bigger
+      const off = t.h * 10;
+      ctx.save();
+      shadow(t.x, t.y + off * 0.6, s / 2 * (1 - t.h * 0.15), s / 2 * 0.34 * (1 - t.h * 0.15), 0.28 + 0.14 * (1 - t.h));
+      ctx.translate(t.x, t.y - off);
+      ctx.scale(scale, scale);
+      // body
+      roundRect(ctx, -s / 2, -s / 2, s, s, 10);
+      ctx.fillStyle = PALETTE.stone; ctx.fill();
+      ctx.strokeStyle = PALETTE.stoneDark; ctx.lineWidth = 4; ctx.stroke();
+      roundRect(ctx, -s / 2 + 6, -s / 2 + 6, s - 12, 10, 5);
+      ctx.fillStyle = PALETTE.stoneLite; ctx.fill();
+      // rivets
+      ctx.fillStyle = PALETTE.stoneDark;
+      [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0] * (s / 2 - 11), p[1] * (s / 2 - 11), 3, 0, TAU); ctx.fill();
+      });
+      // face — surprised when it drops, sleepy when it waits
+      ctx.fillStyle = PALETTE.ink;
+      const eo = t.h < 0.3 ? 6 : 5;
+      ctx.beginPath(); ctx.ellipse(-11, -2, 4.5, eo, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse( 11, -2, 4.5, eo, 0, 0, TAU); ctx.fill();
+      if (t.h < 0.3) {
+        ctx.beginPath(); ctx.ellipse(0, 15, 8, 9, 0, 0, TAU); ctx.fill();
+      } else {
+        ctx.lineWidth = 3.5; ctx.strokeStyle = PALETTE.ink; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(-9, 16); ctx.lineTo(9, 16); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  },
+
+  /* -- Piranha plant: pops from a pipe and spits the ball off sideways --- */
+  piranha: {
+    init(t) { t.time = t.phase || 0; t.out = 0; t.chomp = 0; t.r = 26; },
+    /** Its own pipe, drawn with the scenery so the plant can sit on top. */
+    drawBase(t) { drawPipe(t.x, t.y, t.r, 0, false); },
+    update(t, dt) {
+      t.time = (t.time + dt) % t.period;
+      const f = t.time / t.period;
+      // out for the middle half of the cycle, with soft ease in and out
+      t.out = f < 0.25 ? 0
+            : f < 0.40 ? (f - 0.25) / 0.15
+            : f < 0.70 ? 1
+            : f < 0.85 ? 1 - (f - 0.70) / 0.15
+            : 0;
+      t.chomp += dt * 9;
+    },
+    collide(t, b) {
+      if (t.out < 0.6) return;
+      const d = len(b.x - t.x, b.y - t.y);
+      if (d > 30 + b.r) return;
+      // Spat out in a silly direction — always away from the plant.
+      const base = Math.atan2(b.y - t.y, b.x - t.x);
+      const ang = base + (Math.random() - 0.5) * 1.8;
+      const sp = Math.max(len(b.vx, b.vy) * 0.9, 480);
+      b.x = t.x + Math.cos(ang) * (34 + b.r);
+      b.y = t.y + Math.sin(ang) * (34 + b.r);
+      b.vx = Math.cos(ang) * sp;
+      b.vy = Math.sin(ang) * sp;
+      Sound.chomp();
+      addFloater(t.x, t.y - 40, 'Ptooey!', '#ff9db0');
+      burst(t.x, t.y, 10, '#ff6f91', 150);
+    },
+    draw(t) {
+      if (t.out <= 0.01) return;
+      const s = t.out;
+      const open = 0.5 + 0.5 * Math.sin(t.chomp);
+      ctx.save();
+      ctx.translate(t.x, t.y);
+      ctx.scale(s, s);
+      // stalk
+      ctx.fillStyle = PALETTE.pipe;
+      ctx.beginPath(); ctx.ellipse(0, 6, 8, 10, 0, 0, TAU); ctx.fill();
+      // head
+      ctx.fillStyle = '#e0403f';
+      ctx.beginPath(); ctx.ellipse(0, -6, 22, 20, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      [[-9, -14], [9, -12], [0, 2], [-13, 0], [13, -2]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0], p[1], 3.6, 0, TAU); ctx.fill();
+      });
+      // mouth
+      ctx.fillStyle = '#8d1f26';
+      ctx.beginPath();
+      ctx.ellipse(0, -6, 13, 5 + open * 6, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * 8 - 4, -6 - open * 5);
+        ctx.lineTo(i * 8,     -6 - open * 1);
+        ctx.lineTo(i * 8 + 4, -6 - open * 5);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  },
+
+  /* -- Bumper: springy ? block that pops a coin ------------------------- */
+  bumper: {
+    init(t) { t.pop = 0; },
+    update(t, dt) { t.pop = Math.max(0, t.pop - dt * 3.2); },
+    collide(t, b) {
+      const impact = hitCircle(b, t.x, t.y, t.r, 1.15);
+      if (impact > 0) {
+        // Always give a lively kick, even on a feeble roll-in.
+        const d = len(b.x - t.x, b.y - t.y) || 1;
+        const nx = (b.x - t.x) / d, ny = (b.y - t.y) / d;
+        const sp = Math.max(len(b.vx, b.vy), 430);
+        b.vx = nx * sp; b.vy = ny * sp;
+        t.pop = 1;
+        Sound.coin();
+        popCoin(t.x, t.y - t.r);
+      }
+    },
+    draw(t) {
+      const s = 1 + t.pop * 0.22;
+      const w = t.r * 1.9 * s;
+      ctx.save();
+      shadow(t.x, t.y + t.r * 0.9, t.r * 0.95, t.r * 0.35);
+      ctx.translate(t.x, t.y);
+      roundRect(ctx, -w / 2, -w / 2, w, w, 8);
+      ctx.fillStyle = '#f2b23a'; ctx.fill();
+      ctx.strokeStyle = '#94651a'; ctx.lineWidth = 4; ctx.stroke();
+      roundRect(ctx, -w / 2 + 6, -w / 2 + 6, w - 12, 8, 4);
+      ctx.fillStyle = '#ffd98a'; ctx.fill();
+      ctx.fillStyle = '#6b4310';
+      [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0] * (w / 2 - 8), p[1] * (w / 2 - 8), 2.6, 0, TAU); ctx.fill();
+      });
+      ctx.fillStyle = '#7a4a12';
+      ctx.font = 'bold ' + Math.round(t.r * 1.35) + 'px Trebuchet MS, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('?', 0, 2);
+      ctx.restore();
+    }
+  },
+
+  /* -- Banana peel: one-shot spin-out ----------------------------------- */
+  banana: {
+    init(t) { t.used = false; t.r = 14; t.rot = Math.random() * TAU; },
+    update() {},
+    collide(t, b) {
+      if (t.used) return;
+      if (len(b.x - t.x, b.y - t.y) > t.r + b.r) return;
+      t.used = true;
+      const sp = Math.max(len(b.vx, b.vy), 320);
+      const ang = Math.atan2(b.vy, b.vx) + (Math.random() < 0.5 ? -1 : 1) * (0.9 + Math.random() * 0.6);
+      b.vx = Math.cos(ang) * sp * 1.1;
+      b.vy = Math.sin(ang) * sp * 1.1;
+      Sound.slip();
+      burst(t.x, t.y, 10, '#ffe066', 140);
+      addFloater(t.x, t.y - 22, 'Whoops!', '#ffe066');
+    },
+    draw(t) {
+      if (t.used) return;
+      ctx.save();
+      shadow(t.x, t.y + 8, 12, 4);
+      ctx.translate(t.x, t.y);
+      ctx.rotate(t.rot);
+      ctx.fillStyle = '#f4d13d';
+      ctx.beginPath();
+      ctx.arc(0, 0, 13, 0.15 * Math.PI, 0.95 * Math.PI);
+      ctx.arc(0, 4, 10, 0.95 * Math.PI, 0.15 * Math.PI, true);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#c9a520'; ctx.lineWidth = 1.6; ctx.stroke();
+      ctx.fillStyle = '#8b6a1c';
+      ctx.beginPath(); ctx.arc(-12, 2, 2.6, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(12, 2, 2.6, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  },
+
+  /* -- Boost arrows: a conveyor strip ------------------------------------ */
+  boost: {
+    init(t) { t.scroll = 0; },
+    update(t, dt) { t.scroll = (t.scroll + dt * 90) % 40; },
+    collide() { /* handled in substep so it applies continuously */ },
+    draw(t) {
+      ctx.save();
+      roundRect(ctx, t.x, t.y, t.w, t.h, 10);
+      ctx.fillStyle = 'rgba(255,255,255,.16)'; ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.clip();
+      const ang = Math.atan2(t.dy, t.dx);
+      const along = Math.abs(t.dx) > Math.abs(t.dy) ? t.w : t.h;
+      const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
+      const across = Math.abs(t.dx) > Math.abs(t.dy) ? t.h : t.w;
+      const lanes = Math.max(1, Math.round(across / 42));
+      for (let l = 0; l < lanes; l++) {
+        const off = (l - (lanes - 1) / 2) * 42;
+        for (let d = -40; d < along + 40; d += 40) {
+          const p = d + t.scroll - along / 2;
+          const px = cx + Math.cos(ang) * p - Math.sin(ang) * off;
+          const py = cy + Math.sin(ang) * p + Math.cos(ang) * off;
+          ctx.save();
+          ctx.translate(px, py); ctx.rotate(ang);
+          ctx.fillStyle = 'rgba(255,255,255,.55)';
+          ctx.beginPath();
+          ctx.moveTo(-8, -11); ctx.lineTo(9, 0); ctx.lineTo(-8, 11); ctx.lineTo(-3, 0);
+          ctx.closePath(); ctx.fill();
+          ctx.restore();
+        }
+      }
+      ctx.restore();
+    }
+  },
+
+  /* -- Chain Chomp: lunges at the ball, swats it away, never bites ------- */
+  chomp: {
+    init(t) {
+      t.px = t.x; t.py = t.y; t.r = 26; t.lunge = 0; t.cool = 0; t.bob = Math.random() * TAU;
+      t.chain = 74;
+    },
+    update(t, dt) {
+      t.bob += dt * 2.4;
+      t.cool = Math.max(0, t.cool - dt);
+      const d = len(ball.x - t.px, ball.y - t.py);
+      const wants = (d < t.range && !ball.sunk);
+      t.lunge = clamp(t.lunge + (wants ? dt * 4 : -dt * 3), 0, 1);
+
+      // Target sits on a leash of length `chain` from the post.
+      // At rest it prowls at the far end of its leash, so the chain reads as a
+      // chain rather than the head sitting on top of the post.
+      let tx, ty;
+      if (wants) { tx = ball.x; ty = ball.y; }
+      else {
+        tx = t.cx + Math.cos(t.bob) * t.chain * 0.8;
+        ty = t.cy + Math.sin(t.bob * 0.8) * t.chain * 0.55;
+      }
+      let dx = tx - t.cx, dy = ty - t.cy;
+      const dl = len(dx, dy) || 1;
+      const reach = Math.min(dl, t.chain);
+      tx = t.cx + dx / dl * reach;
+      ty = t.cy + dy / dl * reach;
+      const k = wants ? 9 : 3;
+      t.px += (tx - t.px) * Math.min(1, k * dt);
+      t.py += (ty - t.py) * Math.min(1, k * dt);
+    },
+    collide(t, b) {
+      const impact = hitCircle(b, t.px, t.py, t.r, 1.0);
+      if (impact > 0 && t.cool <= 0) {
+        const d = len(b.x - t.px, b.y - t.py) || 1;
+        const sp = Math.max(len(b.vx, b.vy), 520);
+        b.vx = (b.x - t.px) / d * sp;
+        b.vy = (b.y - t.py) / d * sp;
+        t.cool = 0.4;
+        Sound.chomp();
+        burst(t.px, t.py, 10, '#cfd3e0', 160);
+        addFloater(t.px, t.py - 40, 'Woof!', '#ffffff');
+      }
+    },
+    draw(t) {
+      // post
+      ctx.save();
+      shadow(t.cx, t.cy + 8, 12, 5);
+      ctx.fillStyle = PALETTE.stoneDark;
+      roundRect(ctx, t.cx - 9, t.cy - 9, 18, 18, 4); ctx.fill();
+      ctx.strokeStyle = '#3d4252'; ctx.lineWidth = 3; ctx.stroke();
+      // chain
+      const dx = t.px - t.cx, dy = t.py - t.cy;
+      const links = 6;
+      for (let i = 1; i <= links; i++) {
+        const f = i / (links + 1);
+        ctx.beginPath();
+        ctx.arc(t.cx + dx * f, t.cy + dy * f, 5, 0, TAU);
+        ctx.fillStyle = '#9aa0b4'; ctx.fill();
+        ctx.strokeStyle = '#5d6376'; ctx.lineWidth = 2; ctx.stroke();
+      }
+      // head
+      shadow(t.px, t.py + t.r * 0.85, t.r * 0.9, t.r * 0.34);
+      const g = ctx.createRadialGradient(t.px - 8, t.py - 10, 4, t.px, t.py, t.r);
+      g.addColorStop(0, '#4a4f60'); g.addColorStop(1, '#1b1e28');
+      ctx.beginPath(); ctx.arc(t.px, t.py, t.r, 0, TAU);
+      ctx.fillStyle = g; ctx.fill();
+      // teeth ring facing the ball
+      const ang = Math.atan2(ball.y - t.py, ball.x - t.px);
+      const open = 0.25 + t.lunge * 0.35;
+      ctx.save();
+      ctx.translate(t.px, t.py); ctx.rotate(ang);
+      ctx.fillStyle = '#ff9aa6';
+      ctx.beginPath(); ctx.moveTo(0, 0);
+      ctx.arc(0, 0, t.r, -open, open); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      for (let i = -2; i <= 2; i++) {
+        const a = i * open * 0.42;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * t.r, Math.sin(a) * t.r);
+        ctx.lineTo(Math.cos(a - 0.09) * (t.r - 9), Math.sin(a - 0.09) * (t.r - 9));
+        ctx.lineTo(Math.cos(a + 0.09) * (t.r - 9), Math.sin(a + 0.09) * (t.r - 9));
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.restore();
+      // eyes
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(t.px - 8, t.py - 11, 6, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(t.px + 8, t.py - 11, 6, 0, TAU); ctx.fill();
+      ctx.fillStyle = PALETTE.ink;
+      const ex = Math.cos(ang) * 2.2, ey = Math.sin(ang) * 2.2;
+      ctx.beginPath(); ctx.arc(t.px - 8 + ex, t.py - 11 + ey, 3, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(t.px + 8 + ex, t.py - 11 + ey, 3, 0, TAU); ctx.fill();
+      ctx.restore();
+    }
+  }
+};
+
+
+/* ============================================================================
+ * 8. PARTICLES, COINS, FLOATING TEXT, CONFETTI
+ * ==========================================================================*/
+
+function burst(x, y, n, color, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU;
+    const s = speed * (0.35 + Math.random() * 0.65);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+                     life: 0.45, max: 0.45, c: color, r: 2 + Math.random() * 2.5 });
+  }
+}
+
+function popCoin(x, y) {
+  particles.push({ x, y, vx: 0, vy: -180, life: 0.6, max: 0.6, c: '#ffd93d', r: 7, coin: true });
+}
+
+function addFloater(x, y, text, color) {
+  floaters.push({ x, y, text, c: color || '#fff', life: 1.1, max: 1.1 });
+}
+
+function makeConfetti() {
+  confetti = [];
+  const cols = ['#ff5252', '#ffd93d', '#4ade80', '#38bdf8', '#c084fc', '#fb923c'];
+  for (let i = 0; i < 140; i++) {
+    confetti.push({
+      x: Math.random() * W, y: -20 - Math.random() * 400,
+      vx: (Math.random() - 0.5) * 60, vy: 90 + Math.random() * 150,
+      w: 6 + Math.random() * 8, h: 8 + Math.random() * 10,
+      rot: Math.random() * TAU, vr: (Math.random() - 0.5) * 8,
+      c: cols[(Math.random() * cols.length) | 0]
+    });
+  }
+}
+
+function updateEffects(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.coin) p.vy += 620 * dt; else { p.vx *= 0.94; p.vy *= 0.94; }
+  }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i];
+    f.life -= dt; f.y -= 26 * dt;
+    if (f.life <= 0) floaters.splice(i, 1);
+  }
+  for (let i = confetti.length - 1; i >= 0; i--) {
+    const c = confetti[i];
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+    if (c.y > H + 40) confetti.splice(i, 1);
+  }
+}
+
+
+/* ============================================================================
+ * 9. LEVEL SETUP & FLOW
+ * ==========================================================================*/
+
+function loadHole(i) {
+  Game.holeIndex = clamp(i, 0, LEVELS.length - 1);
+  const L = LEVELS[Game.holeIndex];
+  Game.level = L;
+  Game.strokes = 0;
+  Game.screen = 'PLAYING';
+  Game.message = '';
+  Game.shake = 0;
+
+  // Boundary walls are implicit so no level can ever leak.
+  walls = [
+    { x: 0, y: HUD_H, w: W, h: WALL_T },
+    { x: 0, y: H - WALL_T, w: W, h: WALL_T },
+    { x: 0, y: HUD_H, w: WALL_T, h: H - HUD_H },
+    { x: W - WALL_T, y: HUD_H, w: WALL_T, h: H - HUD_H }
+  ].concat(L.walls.map(w => ({ x: w.x, y: w.y, w: w.w, h: w.h })));
+
+  // Surfaces get their decorative speckles generated once, deterministically.
+  surfaces = L.surfaces.map((s, idx) => {
+    const rnd = seeded(Game.holeIndex * 977 + idx * 131 + 7);
+    const dots = [];
+    const n = Math.floor(s.w * s.h / 900);
+    for (let k = 0; k < n; k++) {
+      dots.push({ x: s.x + rnd() * s.w, y: s.y + rnd() * s.h, r: 1 + rnd() * 2.4, a: rnd() });
+    }
+    return { type: s.type, x: s.x, y: s.y, w: s.w, h: s.h, dots };
+  });
+
+  traps = L.traps.map(t => {
+    const copy = Object.assign({}, t);
+    const def = TRAP_TYPES[copy.t];
+    if (def && def.init) def.init(copy);
+    return copy;
+  });
+
+  decor = L.decor || [];
+  particles = []; floaters = []; confetti = [];
+
+  ball.x = L.tee.x; ball.y = L.tee.y;
+  ball.vx = ball.vy = 0;
+  ball.moving = false; ball.squash = 0; ball.sunk = false; ball.sinking = 0;
+  ball.face = Math.atan2(L.cup.y - L.tee.y, L.cup.x - L.tee.x);
+  safeSpot = { x: L.tee.x, y: L.tee.y };
+  aim.active = false;
+}
+
+function shoot() {
+  if (ball.sunk || ball.squash > 0) return;
+  if (aim.power < MIN_POWER) return;
+  const sp = aim.power * MAX_SPEED;
+  ball.vx = aim.dx * sp;
+  ball.vy = aim.dy * sp;
+  ball.moving = true;
+  Game.strokes++;
+  Sound.putt(aim.power);
+  burst(ball.x, ball.y, 5, '#ffffff', 90);
+}
+
+function praise(strokes, par) {
+  if (strokes === 1) return 'HOLE IN ONE!';
+  const d = strokes - par;
+  if (d <= -2) return 'Eagle! Amazing!';
+  if (d === -1) return 'Birdie! Brilliant!';
+  if (d === 0)  return 'Par! Nice one!';
+  if (d === 1)  return 'Great job!';
+  if (d === 2)  return 'Well done!';
+  return 'You did it!';
+}
+
+function finishHole(skipped) {
+  // A skipped hole is scored as par+2 — never a punishment worth worrying
+  // about, but enough that skipping everything is not the best scorecard.
+  Game.scores[Game.holeIndex] = skipped
+    ? Math.max(Game.strokes, Game.level.par + 2)
+    : Game.strokes;
+  Game.skipped[Game.holeIndex] = !!skipped;
+  if (!skipped) {
+    if (Game.best[Game.holeIndex] == null || Game.strokes < Game.best[Game.holeIndex]) {
+      Game.best[Game.holeIndex] = Game.strokes;
+      saveBest();
+    }
+    Game.message = praise(Game.strokes, Game.level.par);
+    Sound.sink();
+    makeConfetti();
+  } else {
+    Game.message = 'No worries at all!';
+  }
+  Game.screen = 'HOLE_DONE';
+  Game.celebrate = 0;
+}
+
+function nextHole() {
+  if (Game.holeIndex >= LEVELS.length - 1) {
+    Game.screen = 'COURSE_DONE';
+    makeConfetti();
+    Sound.fanfare();
+  } else {
+    loadHole(Game.holeIndex + 1);
+  }
+}
+
+function startCourse() {
+  Game.scores = new Array(LEVELS.length).fill(null);
+  Game.skipped = new Array(LEVELS.length).fill(false);
+  loadHole(0);
+}
+
+function saveBest() {
+  try { localStorage.setItem('mushroom-golf-best-v1', JSON.stringify(Game.best)); }
+  catch (e) { /* private browsing, quota, whatever — never break the game */ }
+}
+
+function loadBest() {
+  try {
+    const raw = localStorage.getItem('mushroom-golf-best-v1');
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      for (let i = 0; i < LEVELS.length; i++) {
+        const v = arr[i];
+        Game.best[i] = (typeof v === 'number' && isFinite(v) && v > 0) ? v : null;
+      }
+    }
+  } catch (e) { /* ignore corrupt or absent data */ }
+}
+
+
+/* ============================================================================
+ * 10. INPUT
+ * ==========================================================================*/
+
+const buttons = [];     // rebuilt every frame, hit-tested on pointer down
+
+function btn(id, x, y, w, h, label, icon) {
+  buttons.push({ id, x, y, w, h, label, icon });
+}
+
+function pointerPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (W / r.width),
+    y: (e.clientY - r.top) * (H / r.height)
+  };
+}
+
+function hitButton(p) {
+  for (let i = buttons.length - 1; i >= 0; i--) {
+    const b = buttons[i];
+    if (pointInRect(p.x, p.y, b)) return b;
+  }
+  return null;
+}
+
+function doAction(id) {
+  Sound.click();
+  switch (id) {
+    case 'play':    Sound.init(); startCourse(); break;
+    case 'retry':   loadHole(Game.holeIndex); break;
+    case 'skip':    if (Game.screen === 'PLAYING') finishHole(true); break;
+    case 'next':    nextHole(); break;
+    case 'again':   startCourse(); break;
+    case 'sound':
+      Sound.on = !Sound.on;
+      if (Sound.on) { Sound.init(); Sound.click(); }
+      break;
+  }
+}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  Sound.init();
+  const p = pointerPos(e);
+
+  const b = hitButton(p);
+  if (b) { doAction(b.id); return; }
+
+  if (Game.screen === 'TITLE')      { doAction('play'); return; }
+  if (Game.screen === 'HOLE_DONE')  { doAction('next'); return; }
+  if (Game.screen === 'COURSE_DONE'){ doAction('again'); return; }
+
+  if (Game.screen === 'PLAYING' && !ball.moving && !ball.sunk && ball.squash <= 0) {
+    aim.active = true;
+    updateAim(p);
+  }
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!aim.active) return;
+  e.preventDefault();
+  updateAim(pointerPos(e));
+});
+
+function endAim(fire) {
+  if (!aim.active) return;
+  aim.active = false;
+  if (fire) shoot();
+  aim.power = 0;
+}
+
+canvas.addEventListener('pointerup',     e => { e.preventDefault(); endAim(true); });
+canvas.addEventListener('pointercancel', e => { endAim(false); });
+canvas.addEventListener('contextmenu',   e => e.preventDefault());
+
+function updateAim(p) {
+  // Slingshot: drag away from the ball, the ball flies the opposite way.
+  let dx = ball.x - p.x, dy = ball.y - p.y;
+  const d = len(dx, dy);
+  if (d < 0.001) { aim.power = 0; return; }
+  aim.dx = dx / d; aim.dy = dy / d;
+  aim.power = clamp(d / MAX_DRAG, 0, 1);
+  aim.x = p.x; aim.y = p.y;
+}
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k >= '1' && k <= '9') {
+    const i = parseInt(k, 10) - 1;
+    if (i < LEVELS.length) { Sound.init(); loadHole(i); }
+    return;
+  }
+  if (k === 'd') Game.debug = !Game.debug;
+  if (k === 'r') { Sound.init(); loadHole(Game.holeIndex); }
+  if (k === 'n' && Game.screen === 'PLAYING') finishHole(true);
+  if (k === 'm') doAction('sound');
+  if (k === ' ' || k === 'enter') {
+    e.preventDefault();
+    if (Game.screen === 'TITLE') doAction('play');
+    else if (Game.screen === 'HOLE_DONE') doAction('next');
+    else if (Game.screen === 'COURSE_DONE') doAction('again');
+  }
+});
+
+
+/* ============================================================================
+ * 11. DRAWING HELPERS
+ * ==========================================================================*/
+
+function shadow(x, y, rx, ry, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 0.22 : alpha;
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+/** `warp` false draws the drabber pipe a Piranha lives in, so a child can tell
+ *  a friendly warp pipe from one with teeth in it. */
+function drawPipe(x, y, r, glow, warp) {
+  const base = warp === false ? '#7c8f5c' : PALETTE.pipe;
+  const dark = warp === false ? '#48562f' : PALETTE.pipeDark;
+  const lite = warp === false ? '#a9bd85' : PALETTE.pipeLite;
+  ctx.save();
+  shadow(x, y + r * 0.5, r * 0.95, r * 0.4);
+  // outer rim
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU);
+  ctx.fillStyle = base; ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = dark; ctx.stroke();
+  // highlight crescent
+  ctx.beginPath(); ctx.arc(x, y, r - 4, Math.PI * 1.05, Math.PI * 1.75);
+  ctx.lineWidth = 6; ctx.strokeStyle = lite; ctx.stroke();
+  // inner throat
+  ctx.beginPath(); ctx.arc(x, y, r - 11, 0, TAU);
+  const g = ctx.createRadialGradient(x, y, 2, x, y, r - 11);
+  g.addColorStop(0, '#08160c'); g.addColorStop(1, '#123f1c');
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = dark; ctx.stroke();
+  if (glow > 0) {
+    ctx.globalAlpha = glow;
+    ctx.beginPath(); ctx.arc(x, y, r - 11, 0, TAU);
+    ctx.fillStyle = '#b7ffc7'; ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawWall(w, style) {
+  const cols = style === 'stone'
+    ? [PALETTE.stone, PALETTE.stoneDark, PALETTE.stoneLite]
+    : style === 'hedge'
+      ? [PALETTE.hedge, PALETTE.hedgeDark, PALETTE.hedgeLite]
+      : [PALETTE.brick, PALETTE.brickDark, PALETTE.brickLite];
+
+  ctx.save();
+  ctx.globalAlpha = 0.25; ctx.fillStyle = '#000';
+  roundRect(ctx, w.x + 3, w.y + 5, w.w, w.h, 6); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  roundRect(ctx, w.x, w.y, w.w, w.h, 6);
+  ctx.fillStyle = cols[0]; ctx.fill();
+  ctx.save(); ctx.clip();
+
+  // mortar grid
+  ctx.strokeStyle = cols[1]; ctx.lineWidth = 2;
+  const bh = 18, bw = 34;
+  for (let y = w.y; y < w.y + w.h; y += bh) {
+    ctx.beginPath(); ctx.moveTo(w.x, y); ctx.lineTo(w.x + w.w, y); ctx.stroke();
+    const off = (((y - w.y) / bh) | 0) % 2 ? bw / 2 : 0;
+    for (let x = w.x + off; x < w.x + w.w; x += bw) {
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + bh); ctx.stroke();
+    }
+  }
+  // top bevel
+  ctx.fillStyle = cols[2]; ctx.globalAlpha = 0.75;
+  ctx.fillRect(w.x, w.y, w.w, 5);
+  ctx.globalAlpha = 0.25; ctx.fillStyle = '#000';
+  ctx.fillRect(w.x, w.y + w.h - 5, w.w, 5);
+  ctx.restore();
+
+  roundRect(ctx, w.x, w.y, w.w, w.h, 6);
+  ctx.strokeStyle = cols[1]; ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+}
+
+function drawSurface(s) {
+  ctx.save();
+  roundRect(ctx, s.x, s.y, s.w, s.h, 14);
+  ctx.save(); ctx.clip();
+
+  if (s.type === 'water') {
+    const g = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+    g.addColorStop(0, '#2f86e0'); g.addColorStop(1, '#1c5fae');
+    ctx.fillStyle = g; ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.lineWidth = 2.5;
+    for (let y = s.y + 16; y < s.y + s.h; y += 24) {
+      ctx.beginPath();
+      for (let x = s.x; x <= s.x + s.w; x += 8) {
+        const yy = y + Math.sin(x * 0.06 + Game.time * 2.2 + y * 0.1) * 3.5;
+        if (x === s.x) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+  } else if (s.type === 'sand') {
+    ctx.fillStyle = '#e6cf8e'; ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.fillStyle = 'rgba(160,130,70,.45)';
+    s.dots.forEach(d => { ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, TAU); ctx.fill(); });
+  } else if (s.type === 'ice') {
+    const g = ctx.createLinearGradient(s.x, s.y, s.x + s.w, s.y + s.h);
+    g.addColorStop(0, '#dff1ff'); g.addColorStop(1, '#a9d6f5');
+    ctx.fillStyle = g; ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 3;
+    s.dots.forEach((d, i) => {
+      if (i % 4) return;
+      ctx.beginPath();
+      ctx.moveTo(d.x - 18, d.y + 10); ctx.lineTo(d.x + 18, d.y - 10);
+      ctx.stroke();
+    });
+  } else if (s.type === 'mud') {
+    ctx.fillStyle = '#6d4a2f'; ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.fillStyle = 'rgba(40,25,12,.5)';
+    s.dots.forEach(d => { ctx.beginPath(); ctx.ellipse(d.x, d.y, d.r * 2.4, d.r * 1.5, 0, 0, TAU); ctx.fill(); });
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = s.type === 'water' ? 'rgba(255,255,255,.6)' : 'rgba(0,0,0,.18)';
+  ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+}
+
+function drawCup(x, y, n) {
+  ctx.save();
+  // hole
+  ctx.beginPath(); ctx.ellipse(x, y, CUP_R, CUP_R * 0.82, 0, 0, TAU);
+  ctx.fillStyle = '#1a2a16'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.65)'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(x, y - 2, CUP_R - 5, CUP_R * 0.5, 0, 0, TAU);
+  ctx.fillStyle = '#0a1408'; ctx.fill();
+  // flag
+  const sway = Math.sin(Game.time * 3) * 3;
+  ctx.strokeStyle = '#f4f4f4'; ctx.lineWidth = 3.5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x, y - 4); ctx.lineTo(x + 3, y - 54); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x + 3, y - 54);
+  ctx.quadraticCurveTo(x + 26 + sway, y - 48, x + 40 + sway, y - 42);
+  ctx.quadraticCurveTo(x + 24 + sway, y - 36, x + 3, y - 34);
+  ctx.closePath();
+  ctx.fillStyle = '#e63946'; ctx.fill();
+  ctx.strokeStyle = '#a51f2c'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 15px Trebuchet MS, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(String(n), x + 17 + sway, y - 43);
+  ctx.restore();
+}
+
+function drawBall() {
+  const b = ball;
+  if (b.sunk && b.sinking >= 1) return;
+
+  const scale = b.sunk ? (1 - b.sinking) : 1;
+  const flat = b.squash > 0 ? clamp(b.squash / 0.9, 0, 1) : 0;
+  const sx = 1 + flat * 0.85, sy = 1 - flat * 0.72;
+
+  ctx.save();
+  if (!b.sunk) shadow(b.x, b.y + 7, b.r * 1.05 * sx, b.r * 0.5, 0.25);
+  ctx.translate(b.x, b.y);
+  ctx.scale(scale * sx, scale * sy);
+
+  // body
+  const g = ctx.createRadialGradient(-3, -4, 1, 0, 0, b.r);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#d7dbe4');
+  ctx.beginPath(); ctx.arc(0, 0, b.r, 0, TAU);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = '#9aa0ad'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // dimples that roll with the ball
+  ctx.fillStyle = 'rgba(140,148,163,.55)';
+  for (let i = 0; i < 4; i++) {
+    const a = b.spin + i * (TAU / 4);
+    ctx.beginPath(); ctx.arc(Math.cos(a) * 4, Math.sin(a) * 4, 1.5, 0, TAU); ctx.fill();
+  }
+
+  // the little red cap, pointing where the ball is heading
+  ctx.rotate(b.face);
+  ctx.fillStyle = '#e23b2e';
+  ctx.beginPath(); ctx.arc(0, 0, b.r - 0.5, Math.PI * 1.08, Math.PI * 1.92); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(b.r * 0.55, -b.r * 0.55, 4.5, 2.6, -0.5, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-1, -b.r * 0.62, 2.4, 0, TAU); ctx.fill();
+
+  ctx.restore();
+
+  if (flat > 0.05) {
+    ctx.save();
+    ctx.globalAlpha = flat * 0.8;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 8 + (1 - flat) * 10, 0, TAU); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawDecor(d) {
+  ctx.save();
+  if (d.t === 'bush') {
+    shadow(d.x, d.y + 12, 22, 7, 0.18);
+    ctx.fillStyle = PALETTE.hedgeDark;
+    [[-14, 2, 14], [14, 2, 14], [0, -6, 17]].forEach(c => {
+      ctx.beginPath(); ctx.arc(d.x + c[0], d.y + c[1], c[2], 0, TAU); ctx.fill();
+    });
+    ctx.fillStyle = PALETTE.hedge;
+    [[-12, 0, 11], [12, 0, 11], [0, -8, 13]].forEach(c => {
+      ctx.beginPath(); ctx.arc(d.x + c[0], d.y + c[1], c[2], 0, TAU); ctx.fill();
+    });
+  } else if (d.t === 'flower') {
+    ctx.fillStyle = '#f7f3d6';
+    for (let i = 0; i < 5; i++) {
+      const a = i * TAU / 5 + Math.sin(Game.time + d.x) * 0.05;
+      ctx.beginPath(); ctx.ellipse(d.x + Math.cos(a) * 6, d.y + Math.sin(a) * 6, 5, 5, 0, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = '#ffd93d';
+    ctx.beginPath(); ctx.arc(d.x, d.y, 4.5, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** Predicted shot path with one bounce, so bank shots become learnable. */
+function predictPath(x, y, dx, dy, maxDist) {
+  const pts = [{ x, y }];
+  let px = x, py = y, ux = dx, uy = dy, bounced = false;
+  const stepLen = 6;
+  for (let d = 0; d < maxDist; d += stepLen) {
+    const nx = px + ux * stepLen, ny = py + uy * stepLen;
+    let hit = null;
+    for (let i = 0; i < walls.length; i++) {
+      const w = walls[i];
+      const cx = clamp(nx, w.x, w.x + w.w), cy = clamp(ny, w.y, w.y + w.h);
+      const ddx = nx - cx, ddy = ny - cy;
+      if (ddx * ddx + ddy * ddy < BALL_R * BALL_R) { hit = { cx, cy }; break; }
+    }
+    if (hit) {
+      if (bounced) break;
+      pts.push({ x: px, y: py, bounce: true });
+      let nvx = px - hit.cx, nvy = py - hit.cy;
+      const l = len(nvx, nvy) || 1;
+      nvx /= l; nvy /= l;
+      const dot = ux * nvx + uy * nvy;
+      ux -= 2 * dot * nvx; uy -= 2 * dot * nvy;
+      bounced = true;
+      continue;
+    }
+    px = nx; py = ny;
+  }
+  pts.push({ x: px, y: py });
+  return pts;
+}
+
+function drawAim() {
+  if (!aim.active || aim.power < MIN_POWER) return;
+  const p = aim.power;
+  const color = p < 0.4 ? '#7ee787' : p < 0.75 ? '#ffd93d' : '#ff6b6b';
+  const dist = 90 + p * 300;
+  const pts = predictPath(ball.x, ball.y, aim.dx, aim.dy, dist);
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.setLineDash([9, 11]);
+  ctx.lineDashOffset = -Game.time * 40;
+  ctx.lineWidth = 5;
+  for (let i = 1; i < pts.length; i++) {
+    ctx.globalAlpha = pts[i - 1].bounce ? 0.4 : 0.9;
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+    ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+
+  // arrow head at the end of the line
+  const a = pts[pts.length - 2], b = pts[pts.length - 1];
+  const ang = Math.atan2(b.y - a.y, b.x - a.x);
+  ctx.save();
+  ctx.translate(b.x, b.y); ctx.rotate(ang);
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.moveTo(14, 0); ctx.lineTo(-6, -9); ctx.lineTo(-6, 9); ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  // pull-back guide
+  ctx.strokeStyle = 'rgba(255,255,255,.5)';
+  ctx.lineWidth = 3; ctx.setLineDash([4, 7]);
+  ctx.beginPath();
+  ctx.moveTo(ball.x, ball.y);
+  ctx.lineTo(ball.x - aim.dx * p * MAX_DRAG, ball.y - aim.dy * p * MAX_DRAG);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // power ring around the ball
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y, BALL_R + 9, -Math.PI / 2, -Math.PI / 2 + TAU * p);
+  ctx.strokeStyle = color; ctx.lineWidth = 5; ctx.stroke();
+  ctx.restore();
+}
+
+
+/* ============================================================================
+ * 12. UI
+ * ==========================================================================*/
+
+function uiButton(b, opts) {
+  opts = opts || {};
+  const big = opts.big;
+  ctx.save();
+  const r = big ? 16 : 10;
+  ctx.globalAlpha = 0.3; ctx.fillStyle = '#000';
+  roundRect(ctx, b.x + 2, b.y + 4, b.w, b.h, r); ctx.fill();
+  ctx.globalAlpha = 1;
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  const c1 = opts.color || '#3f4a63', c2 = opts.color2 || '#2a3247';
+  g.addColorStop(0, c1); g.addColorStop(1, c2);
+  roundRect(ctx, b.x, b.y, b.w, b.h, r);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold ' + (big ? 26 : 17) + 'px Trebuchet MS, sans-serif';
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  ctx.restore();
+}
+
+function drawHUD() {
+  const L = Game.level;
+  ctx.save();
+  const g = ctx.createLinearGradient(0, 0, 0, HUD_H);
+  g.addColorStop(0, '#232a40'); g.addColorStop(1, '#171c2c');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, HUD_H);
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, HUD_H - 3, W, 3);
+
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 24px Trebuchet MS, sans-serif';
+  ctx.fillText('⛳ Hole ' + (Game.holeIndex + 1) + '/' + LEVELS.length, 16, HUD_H / 2);
+
+  ctx.fillStyle = '#e8ecf7';
+  ctx.font = 'bold 20px Trebuchet MS, sans-serif';
+  ctx.fillText(L.name, 190, HUD_H / 2 - 9);
+  ctx.fillStyle = '#9fb0d0';
+  ctx.font = '15px Trebuchet MS, sans-serif';
+  ctx.fillText('Par ' + L.par + (Game.best[Game.holeIndex] != null ? '   ·   Best ' + Game.best[Game.holeIndex] : ''),
+               190, HUD_H / 2 + 11);
+
+  // shot counter
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 30px Trebuchet MS, sans-serif';
+  ctx.fillText(String(Game.strokes), 470, HUD_H / 2 - 3);
+  ctx.fillStyle = '#9fb0d0';
+  ctx.font = 'bold 11px Trebuchet MS, sans-serif';
+  ctx.fillText('SHOTS', 470, HUD_H / 2 + 17);
+
+  // Running total is a plain shot count — over/under par is meaningless to a
+  // small child, so that only appears on the final scorecard.
+  let tot = 0;
+  for (let i = 0; i < LEVELS.length; i++) {
+    if (i === Game.holeIndex && Game.screen === 'PLAYING') tot += Game.strokes;
+    else tot += (Game.scores[i] || 0);
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 30px Trebuchet MS, sans-serif';
+  ctx.fillText(String(tot), 560, HUD_H / 2 - 3);
+  ctx.fillStyle = '#9fb0d0';
+  ctx.font = 'bold 11px Trebuchet MS, sans-serif';
+  ctx.fillText('TOTAL', 560, HUD_H / 2 + 17);
+  ctx.restore();
+
+  // buttons
+  btn('retry', 660, 10, 108, 36, '↺ Again');
+  btn('skip',  776, 10, 106, 36, 'Skip ⏭');
+  btn('sound', 890, 10, 54, 36, '');
+  uiButton(buttons[buttons.length - 3], { color: '#4a5a7d', color2: '#31405e' });
+  uiButton(buttons[buttons.length - 2], { color: '#4a5a7d', color2: '#31405e' });
+  uiButton(buttons[buttons.length - 1], { color: '#4a5a7d', color2: '#31405e' });
+  drawSpeaker(917, 28, Sound.on);
+}
+
+/** Hand-drawn speaker icon — emoji render inconsistently on canvas. */
+function drawSpeaker(x, y, on) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.moveTo(-9, -4); ctx.lineTo(-4, -4); ctx.lineTo(2, -10);
+  ctx.lineTo(2, 10);  ctx.lineTo(-4, 4);  ctx.lineTo(-9, 4);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  if (on) {
+    ctx.beginPath(); ctx.arc(3, 0, 6,  -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(3, 0, 10, -0.9, 0.9); ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(6, -5); ctx.lineTo(14, 5);
+    ctx.moveTo(14, -5); ctx.lineTo(6, 5);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHint() {
+  const L = Game.level;
+  if (!L.hint) return;
+  if (Game.strokes > 1) return;                    // fades out once they get going
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  ctx.font = 'bold 19px Trebuchet MS, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const tw = ctx.measureText(L.hint).width + 34;
+  roundRect(ctx, W / 2 - tw / 2, H - 52, tw, 34, 17);
+  ctx.fillStyle = 'rgba(15,18,28,.75)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = '#ffe9a8';
+  ctx.fillText(L.hint, W / 2, H - 34);
+  ctx.restore();
+}
+
+function panel(x, y, w, h) {
+  ctx.save();
+  ctx.globalAlpha = 0.35; ctx.fillStyle = '#000';
+  roundRect(ctx, x + 4, y + 8, w, h, 22); ctx.fill();
+  ctx.globalAlpha = 1;
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, '#2b3450'); g.addColorStop(1, '#1b2135');
+  roundRect(ctx, x, y, w, h, 22);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = '#ffd93d'; ctx.lineWidth = 4; ctx.stroke();
+  ctx.restore();
+}
+
+function drawTitle() {
+  // a friendly green backdrop so the title feels like the course
+  drawGrass();
+  ctx.save();
+  const bob = Math.sin(Game.time * 2) * 6;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 76px Trebuchet MS, sans-serif';
+  ctx.lineWidth = 12; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#1d3a1f';
+  ctx.strokeText('MUSHROOM', W / 2, 170 + bob);
+  ctx.fillStyle = '#ffd93d';
+  ctx.fillText('MUSHROOM', W / 2, 170 + bob);
+  ctx.font = 'bold 86px Trebuchet MS, sans-serif';
+  ctx.strokeText('MINI-GOLF', W / 2, 250 + bob);
+  ctx.fillStyle = '#ff5a4d';
+  ctx.fillText('MINI-GOLF', W / 2, 250 + bob);
+
+  ctx.font = 'bold 22px Trebuchet MS, sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('9 holes  ·  bouncy Goombas  ·  warp pipes  ·  stompy stones', W / 2, 318);
+  ctx.restore();
+
+  // demo characters along the bottom
+  const demo = [
+    { f: TRAP_TYPES.goomba.draw, t: { px: 270, py: 470, r: 20, walk: Game.time * 6, stun: 0 } },
+    { f: TRAP_TYPES.bumper.draw, t: { x: 690, y: 470, r: 26, pop: (Math.sin(Game.time * 3) + 1) / 2 } }
+  ];
+  demo.forEach(d => d.f(d.t));
+  drawPipe(480, 470, 30, 0);
+
+  btn('play', W / 2 - 150, 370, 300, 66, '▶  PLAY');
+  uiButton(buttons[buttons.length - 1], { big: true, color: '#4ec46b', color2: '#2c8f45' });
+
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,.75)';
+  ctx.font = '16px Trebuchet MS, sans-serif';
+  ctx.fillText('Drag back from the ball and let go. That is the whole game!', W / 2, 550);
+  ctx.restore();
+}
+
+function drawHoleDone() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,10,18,.55)'; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+
+  const pw = 520, ph = 250, px = W / 2 - pw / 2, py = 165;
+  panel(px, py, pw, ph);
+
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const pop = 1 + Math.max(0, 0.25 - Game.celebrate) * 1.2;
+  ctx.translate(W / 2, py + 62);
+  ctx.scale(pop, pop);
+  ctx.font = 'bold 40px Trebuchet MS, sans-serif';
+  ctx.lineWidth = 8; ctx.lineJoin = 'round'; ctx.strokeStyle = '#1b2135';
+  ctx.strokeText(Game.message, 0, 0);
+  ctx.fillStyle = '#ffd93d';
+  ctx.fillText(Game.message, 0, 0);
+  ctx.restore();
+
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#e8ecf7';
+  ctx.font = 'bold 26px Trebuchet MS, sans-serif';
+  const s = Game.scores[Game.holeIndex];
+  ctx.fillText(Game.skipped[Game.holeIndex]
+      ? 'That one was tricky. Try the next!'
+      : 'You took ' + s + ' shot' + (s === 1 ? '' : 's') + '   (par ' + Game.level.par + ')',
+    W / 2, py + 122);
+  ctx.restore();
+
+  const last = Game.holeIndex >= LEVELS.length - 1;
+  btn('next', W / 2 - 130, py + 150, 260, 62, last ? 'See my card ★' : 'Next hole ▶');
+  uiButton(buttons[buttons.length - 1], { big: true, color: '#4ec46b', color2: '#2c8f45' });
+  btn('retry', px + 16, py + ph - 48, 104, 36, '↺ Again');
+  uiButton(buttons[buttons.length - 1], { color: '#4a5a7d', color2: '#31405e' });
+}
+
+function drawCourseDone() {
+  drawGrass();
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,10,18,.5)'; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+
+  const total = Game.scores.reduce((a, s) => a + (s || 0), 0);
+  const diff = total - COURSE_PAR;
+  const stars = diff <= 6 ? 3 : diff <= 18 ? 2 : 1;
+
+  const pw = 720, ph = 430, px = W / 2 - pw / 2, py = 90;
+  panel(px, py, pw, ph);
+
+  ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 40px Trebuchet MS, sans-serif';
+  ctx.lineWidth = 8; ctx.lineJoin = 'round'; ctx.strokeStyle = '#1b2135';
+  ctx.strokeText('COURSE COMPLETE!', W / 2, py + 46);
+  ctx.fillStyle = '#ffd93d';
+  ctx.fillText('COURSE COMPLETE!', W / 2, py + 46);
+
+  // stars
+  for (let i = 0; i < 3; i++) {
+    const on = i < stars;
+    const bump = on ? Math.sin(Game.time * 4 + i) * 3 : 0;
+    drawStar(W / 2 - 90 + i * 90, py + 108 + bump, 30, on ? '#ffd93d' : 'rgba(255,255,255,.18)');
+  }
+
+  // scorecard
+  const cardY = py + 158;
+  ctx.font = 'bold 15px Trebuchet MS, sans-serif';
+  const colW = 68, startX = W / 2 - (LEVELS.length * colW) / 2;
+  ctx.textAlign = 'center';
+  for (let i = 0; i < LEVELS.length; i++) {
+    const x = startX + i * colW + colW / 2;
+    ctx.fillStyle = '#9fb0d0';
+    ctx.fillText(String(i + 1), x, cardY);
+    ctx.fillStyle = 'rgba(255,255,255,.12)';
+    roundRect(ctx, x - colW / 2 + 4, cardY + 14, colW - 8, 46, 8); ctx.fill();
+    const sc = Game.scores[i];
+    const d = sc == null ? 0 : sc - LEVELS[i].par;
+    ctx.fillStyle = sc == null ? '#5a6580' : Game.skipped[i] ? '#8fa0bd'
+                  : d < 0 ? '#7ee787' : d === 0 ? '#ffffff' : '#ffd0a0';
+    ctx.font = 'bold 26px Trebuchet MS, sans-serif';
+    ctx.fillText(sc == null ? '–' : String(sc), x, cardY + 37);
+    ctx.fillStyle = '#8fa0bd';
+    ctx.font = '12px Trebuchet MS, sans-serif';
+    ctx.fillText('par ' + LEVELS[i].par, x, cardY + 54);
+    ctx.font = 'bold 15px Trebuchet MS, sans-serif';
+  }
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 28px Trebuchet MS, sans-serif';
+  ctx.fillText('Total ' + total + '   ·   Par ' + COURSE_PAR + '   ·   ' +
+               (diff === 0 ? 'Even!' : diff < 0 ? (-diff) + ' under par!' : '+' + diff),
+               W / 2, cardY + 92);
+
+  ctx.fillStyle = '#ffe9a8';
+  ctx.font = 'bold 20px Trebuchet MS, sans-serif';
+  ctx.fillText(stars === 3 ? 'Superstar golfer!' : stars === 2 ? 'Brilliant round!' : 'You finished the whole course!',
+               W / 2, cardY + 124);
+  ctx.restore();
+
+  btn('again', W / 2 - 130, py + ph - 88, 260, 62, '↺ Play again');
+  uiButton(buttons[buttons.length - 1], { big: true, color: '#4ec46b', color2: '#2c8f45' });
+}
+
+function drawStar(cx, cy, r, color) {
+  ctx.save();
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 ? r * 0.46 : r;
+    const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+}
+
+
+/* ============================================================================
+ * 13. RENDER
+ * ==========================================================================*/
+
+function drawGrass() {
+  ctx.save();
+  ctx.fillStyle = PALETTE.grassA;
+  ctx.fillRect(0, HUD_H, W, H - HUD_H);
+  ctx.fillStyle = PALETTE.grassB;
+  for (let x = 0; x < W; x += 96) ctx.fillRect(x, HUD_H, 48, H - HUD_H);
+  // soft vignette so the middle reads brighter than the edges
+  const g = ctx.createRadialGradient(W / 2, H / 2, 120, W / 2, H / 2, 620);
+  g.addColorStop(0, 'rgba(255,255,255,.05)');
+  g.addColorStop(1, 'rgba(0,0,0,.22)');
+  ctx.fillStyle = g; ctx.fillRect(0, HUD_H, W, H - HUD_H);
+  ctx.restore();
+}
+
+function drawEffects() {
+  particles.forEach(p => {
+    const a = clamp(p.life / p.max, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = a;
+    if (p.coin) {
+      const sq = Math.abs(Math.cos(Game.time * 12));
+      ctx.fillStyle = '#ffd93d';
+      ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r * (0.25 + sq * 0.75), p.r, 0, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#b98b12'; ctx.lineWidth = 1.5; ctx.stroke();
+    } else {
+      ctx.fillStyle = p.c;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * a, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  });
+
+  floaters.forEach(f => {
+    const a = clamp(f.life / f.max, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold 22px Trebuchet MS, sans-serif';
+    ctx.lineWidth = 6; ctx.lineJoin = 'round'; ctx.strokeStyle = 'rgba(20,24,34,.85)';
+    ctx.strokeText(f.text, f.x, f.y);
+    ctx.fillStyle = f.c;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.restore();
+  });
+}
+
+function drawConfetti() {
+  confetti.forEach(c => {
+    ctx.save();
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.c;
+    ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+    ctx.restore();
+  });
+}
+
+function drawDebug() {
+  ctx.save();
+  ctx.strokeStyle = '#ff00ff'; ctx.lineWidth = 1;
+  walls.forEach(w => ctx.strokeRect(w.x, w.y, w.w, w.h));
+  ctx.strokeStyle = '#00ffff';
+  traps.forEach(t => {
+    if (t.t === 'goomba' || t.t === 'chomp') {
+      ctx.beginPath(); ctx.arc(t.px, t.py, t.r, 0, TAU); ctx.stroke();
+    } else if (t.t === 'bumper' || t.t === 'banana') {
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, TAU); ctx.stroke();
+    } else if (t.t === 'thwomp') {
+      ctx.strokeStyle = t.solid ? '#ff0000' : '#00ff00';
+      ctx.strokeRect(t.rect.x, t.rect.y, t.rect.w, t.rect.h);
+      ctx.strokeStyle = '#00ffff';
+    } else if (t.t === 'pipes') {
+      ctx.beginPath(); ctx.arc(t.x, t.y, 18, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.arc(t.x2, t.y2, 18, 0, TAU); ctx.stroke();
+    } else if (t.t === 'boost') {
+      ctx.strokeRect(t.x, t.y, t.w, t.h);
+    }
+  });
+  ctx.fillStyle = '#0f0';
+  ctx.font = '13px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('fps ' + Game.fps.toFixed(0), 8, HUD_H + 6);
+  ctx.fillText('vel ' + len(ball.vx, ball.vy).toFixed(0), 8, HUD_H + 22);
+  ctx.fillText('pos ' + ball.x.toFixed(0) + ',' + ball.y.toFixed(0), 8, HUD_H + 38);
+  ctx.fillText('surf ' + surfaceAt(ball.x, ball.y), 8, HUD_H + 54);
+  ctx.restore();
+}
+
+function render() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== W * dpr) {
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  buttons.length = 0;
+
+  if (Game.screen === 'TITLE') { drawTitle(); return; }
+  if (Game.screen === 'COURSE_DONE') { drawCourseDone(); drawConfetti(); return; }
+
+  // screen shake, applied to the course but never to the HUD
+  ctx.save();
+  if (Game.shake > 0.1) {
+    ctx.translate((Math.random() - 0.5) * Game.shake, (Math.random() - 0.5) * Game.shake);
+  }
+
+  drawGrass();
+  decor.forEach(drawDecor);
+  surfaces.forEach(drawSurface);
+  drawCup(Game.level.cup.x, Game.level.cup.y, Game.holeIndex + 1);
+
+  // boost pads and pipe mouths sit under everything so the ball reads on top
+  traps.forEach(t => { if (t.t === 'boost') TRAP_TYPES.boost.draw(t); });
+  traps.forEach(t => { if (t.t === 'piranha') TRAP_TYPES.piranha.drawBase(t); });
+  walls.forEach(w => drawWall(w, Game.level.wallStyle));
+  traps.forEach(t => { if (t.t !== 'boost' && t.t !== 'piranha') TRAP_TYPES[t.t].draw(t); });
+
+  drawAim();
+  drawBall();
+  // the plant reaches over the ball, which is what makes it feel alive
+  traps.forEach(t => { if (t.t === 'piranha') TRAP_TYPES.piranha.draw(t); });
+  drawEffects();
+
+  if (Game.debug) drawDebug();
+  ctx.restore();
+
+  drawHUD();
+  if (Game.screen === 'PLAYING') drawHint();
+  if (Game.screen === 'HOLE_DONE') { drawConfetti(); drawHoleDone(); }
+}
+
+
+/* ============================================================================
+ * 14. MAIN LOOP
+ * ==========================================================================*/
+
+let last = 0, acc = 0, fpsAcc = 0, fpsCount = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!last) { last = now; return; }
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > MAX_FRAME) dt = MAX_FRAME;
+
+  Game.time += dt;
+  Game.shake *= Math.pow(0.02, dt);
+  Game.celebrate += dt;
+
+  fpsAcc += dt; fpsCount++;
+  if (fpsAcc > 0.5) { Game.fps = fpsCount / fpsAcc; fpsAcc = 0; fpsCount = 0; }
+
+  updateEffects(dt);
+
+  if (Game.screen === 'PLAYING') {
+    // traps animate even while the child is lining up a shot
+    for (let i = 0; i < traps.length; i++) {
+      const def = TRAP_TYPES[traps[i].t];
+      if (def && def.update) def.update(traps[i], dt);
+    }
+
+    acc += dt;
+    let guard = 0;
+    while (acc >= FIXED_DT && guard++ < 400) {
+      stepPhysics(FIXED_DT);
+      acc -= FIXED_DT;
+    }
+    if (guard >= 400) acc = 0;
+
+    // ball has come to rest?
+    if (!ball.sunk && ball.squash <= 0) {
+      const sp = len(ball.vx, ball.vy);
+      if (sp < REST_SPEED) {
+        ball.vx = ball.vy = 0;
+        if (ball.moving) {
+          ball.moving = false;
+          if (isSafeSpot(ball.x, ball.y)) { safeSpot.x = ball.x; safeSpot.y = ball.y; }
+        }
+      } else {
+        ball.moving = true;
+      }
+    }
+
+    // sinking animation, then the celebration
+    if (ball.sunk) {
+      if (ball.sinking === 0) {
+        burst(Game.level.cup.x, Game.level.cup.y, 14, '#ffd93d', 160);
+      }
+      ball.sinking = Math.min(1, ball.sinking + dt * 2.6);
+      ball.x = lerp(ball.x, Game.level.cup.x, Math.min(1, dt * 12));
+      ball.y = lerp(ball.y, Game.level.cup.y, Math.min(1, dt * 12));
+      if (ball.sinking >= 1) finishHole(false);
+    }
+  }
+
+  render();
+}
+
+loadBest();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
