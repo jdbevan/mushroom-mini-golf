@@ -16,8 +16,8 @@ fine on a tablet.
 ## Designed for small children
 
 - **You cannot lose.** No timer, no lives, no game over. Unlimited shots.
-- The worst thing that can happen anywhere in the game is one extra shot (only water
-  does this) and the ball being placed gently back on the bank.
+- **Nothing on the course can cost you a shot.** Only your own swings count. Land in
+  the water and the ball simply floats — you putt it back out.
 - Every message is encouraging — even a very high score just says "You did it!".
 - **Again** and **Skip** buttons are always on screen, so a stuck child can move on
   without needing a grown-up.
@@ -52,10 +52,11 @@ Each hole introduces one new idea, so nothing arrives unexplained.
 | Speed arrows | Conveyor strip that pushes the ball along | none |
 | Sand / mud | Bogs the ball down fast | none |
 | Ice | Almost no friction — the ball keeps sliding | none |
-| Water | Splash, and the ball is placed back on the nearest bank | **+1 shot** |
+| Water | Splash — then the ball floats and bobs on the surface. Heavy drag, so it takes a firm putt to get out | none |
 | Chain Chomp | Lunges on its chain and swats the ball away | none |
 
-Water is the only thing in the whole game that costs a shot.
+Nothing in the table costs a shot. The only thing that increments the counter is the
+player taking a swing.
 
 ## Keyboard shortcuts (handy for testing)
 
@@ -103,7 +104,10 @@ stubbed DOM under Node:
   would show up) confirmed the ball never escapes the course, never comes to rest
   inside a wall, and always stops.
 - **Trap coverage** — every trap type is confirmed to actually fire in play, and
-  `Game.strokes++` exists in exactly two places: the player's own swing, and water.
+  `Game.strokes++` exists in exactly one place: the player's own swing.
+- **Pond escapes** — since the ball floats rather than being rescued, it is dropped at
+  the centre and all four corners of every water body and putted out. Worst case is
+  three shots to dry land; usually one.
 
 ## A note on the theme
 
