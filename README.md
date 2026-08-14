@@ -45,7 +45,7 @@ Each hole introduces one new idea, so nothing arrives unexplained.
 |------|--------------|------|
 | Goomba | Bounces the ball back extra hard and stumbles about | none |
 | Warp pipe | Rolls you in one end and out the other, at speed | none |
-| Thwomp | Slams down. Caught underneath, the ball is squashed flat, then pops back | none |
+| Thwomp | Slams down and hides whatever is under it. Caught underneath, the ball is held squashed flat until the stone lifts, then pops back out | none |
 | Piranha plant | Pops out of its own (olive-coloured) pipe and spits the ball somewhere silly | none |
 | ? block | Springy bumper that pops out a coin | none |
 | Banana peel | One-shot spin-out, then it vanishes | none |
@@ -108,6 +108,9 @@ stubbed DOM under Node:
 - **Pond escapes** — since the ball floats rather than being rescued, it is dropped at
   the centre and all four corners of every water body and putted out. Worst case is
   three shots to dry land; usually one.
+- **Thwomp occlusion** — asserts stones draw after the ball, and that the
+  "ball is under here" marker appears when (and only when) the ball is inside a
+  Thwomp footprint and not squashed.
 
 ## A note on the theme
 

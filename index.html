@@ -66,6 +66,7 @@ const MAX_DRAG    = 190;         // pixels of pull-back that equals full power
 const MAX_SPEED   = 1000;        // px/sec at full power
 const MIN_POWER   = 0.045;       // below this a drag is treated as a mis-tap
 const REST_SPEED  = 11;          // below this the ball is considered stopped
+const SQUASH_TIME = 0.45;        // how long the flattened ball takes to pop back
 const SINK_SPEED  = 330;         // faster than this and the ball lips out
 const WALL_BOUNCE = 0.70;
 
@@ -593,10 +594,45 @@ function substep(dt) {
   }
 }
 
+/**
+ * When the squash wears off, squirt the ball out from under the stone toward
+ * its nearest clear edge. Without this a ball that stops under a Thwomp gets
+ * flattened again on every cycle, leaving the child almost no window to aim.
+ */
+function popOutFromThwomp() {
+  const b = ball;
+  for (let i = 0; i < traps.length; i++) {
+    const t = traps[i];
+    if (t.t !== 'thwomp' || !pointInRect(b.x, b.y, t.rect)) continue;
+    const r = t.rect;
+    const ways = [
+      { d: b.x - r.x,       ux: -1, uy:  0 },
+      { d: r.x + r.w - b.x, ux:  1, uy:  0 },
+      { d: b.y - r.y,       ux:  0, uy: -1 },
+      { d: r.y + r.h - b.y, ux:  0, uy:  1 }
+    ].sort((a, c) => a.d - c.d);
+    for (let k = 0; k < ways.length; k++) {
+      const w = ways[k];
+      if (isSafeSpot(b.x + w.ux * (w.d + b.r + 6), b.y + w.uy * (w.d + b.r + 6))) {
+        b.vx = w.ux * 130; b.vy = w.uy * 130;
+        break;
+      }
+    }
+    burst(b.x, b.y, 8, '#d8d8e4', 90);
+    Sound.boing();
+    return;
+  }
+}
+
 function stepPhysics(dt) {
   const b = ball;
 
-  if (b.squash > 0) { b.squash -= dt; b.vx = b.vy = 0; return; }
+  if (b.squash > 0) {
+    b.squash -= dt;
+    b.vx = b.vy = 0;
+    if (b.squash <= 0) { b.squash = 0; popOutFromThwomp(); }
+    return;
+  }
   if (b.sunk) return;
 
   // Subdivide so a full-power shot cannot tunnel through a thin wall.
@@ -753,6 +789,13 @@ const TRAP_TYPES = {
       }
       if (t.h >= 1) t.catching = false;
 
+      // While the stone is still sitting on the ball, keep it pinned flat. The
+      // squash timer only starts running down once the stone lifts clear, so
+      // the pop back to round actually happens where the child can see it.
+      if (ball.squash > 0 && t.h < 0.5 && pointInRect(ball.x, ball.y, t.rect)) {
+        ball.squash = SQUASH_TIME;
+      }
+
       // The moment it lands
       if (t.prevH > 0 && t.h === 0) {
         Sound.thwomp();
@@ -765,7 +808,7 @@ const TRAP_TYPES = {
         }
         // Caught underneath? Squashed flat, pops back, no penalty.
         if (t.catching && !ball.sunk) {
-          ball.squash = 0.9; ball.vx = ball.vy = 0;
+          ball.squash = SQUASH_TIME; ball.vx = ball.vy = 0;
           addFloater(ball.x, ball.y - 28, 'Squish!', '#ffd166');
         }
         t.catching = false;
@@ -1564,7 +1607,7 @@ function drawBall() {
   if (b.sunk && b.sinking >= 1) return;
 
   const scale = b.sunk ? (1 - b.sinking) : 1;
-  const flat = b.squash > 0 ? clamp(b.squash / 0.9, 0, 1) : 0;
+  const flat = b.squash > 0 ? clamp(b.squash / SQUASH_TIME, 0, 1) : 0;
   const sx = 1 + flat * 0.85, sy = 1 - flat * 0.72;
   const floating = !b.sunk && b.wet;
 
@@ -1631,6 +1674,34 @@ function drawBall() {
     ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 8 + (1 - flat) * 10, 0, TAU); ctx.stroke();
     ctx.restore();
   }
+}
+
+/**
+ * Now that a Thwomp hides the ball, a ball resting under a raised one would be
+ * invisible and impossible to aim. Show a marker through the stone instead.
+ * Skipped while the ball is squashed — being hidden under the stone is the joke,
+ * and the "Squish!" label already says what happened.
+ */
+function drawHiddenBallMarker() {
+  if (ball.sunk || ball.squash > 0) return;
+  let hidden = false;
+  for (let i = 0; i < traps.length; i++) {
+    const t = traps[i];
+    if (t.t === 'thwomp' && pointInRect(ball.x, ball.y, t.rect)) { hidden = true; break; }
+  }
+  if (!hidden) return;
+
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.lineDashOffset = -Game.time * 16;
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r + 5, 0, TAU); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,255,255,.95)';
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, 2.6, 0, TAU); ctx.fill();
+  ctx.restore();
 }
 
 function drawDecor(d) {
@@ -2151,10 +2222,17 @@ function render() {
   traps.forEach(t => { if (t.t === 'boost') TRAP_TYPES.boost.draw(t); });
   traps.forEach(t => { if (t.t === 'piranha') TRAP_TYPES.piranha.drawBase(t); });
   walls.forEach(w => drawWall(w, Game.level.wallStyle));
-  traps.forEach(t => { if (t.t !== 'boost' && t.t !== 'piranha') TRAP_TYPES[t.t].draw(t); });
+  traps.forEach(t => {
+    if (t.t !== 'boost' && t.t !== 'piranha' && t.t !== 'thwomp') TRAP_TYPES[t.t].draw(t);
+  });
 
   drawAim();
   drawBall();
+  // Thwomps draw over the ball: a stone slab this size should hide whatever is
+  // underneath it, otherwise a squashed ball floats on top of the thing
+  // squashing it.
+  traps.forEach(t => { if (t.t === 'thwomp') TRAP_TYPES.thwomp.draw(t); });
+  drawHiddenBallMarker();
   // the plant reaches over the ball, which is what makes it feel alive
   traps.forEach(t => { if (t.t === 'piranha') TRAP_TYPES.piranha.draw(t); });
   drawEffects();
