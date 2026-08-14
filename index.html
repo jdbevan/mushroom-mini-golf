@@ -941,19 +941,47 @@ const TRAP_TYPES = {
     },
     draw(t) {
       if (t.used) return;
+      const OUTLINE = '#6d5210', SKIN = '#f7d94a', FLAP = '#eccb3c';
       ctx.save();
-      shadow(t.x, t.y + 8, 12, 4);
+      shadow(t.x, t.y + 9, 15, 5);
       ctx.translate(t.x, t.y);
       ctx.rotate(t.rot);
-      ctx.fillStyle = '#f4d13d';
+      ctx.translate(-5, 0);          // the flaps stick out one side; re-centre
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      // Two peel strips curling off the stalk end. Drawn first so the body
+      // covers where they join it.
+      const flap = (ang, length, w) => {
+        ctx.save();
+        ctx.translate(12.4, 3.2);
+        ctx.rotate(ang);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(length * 0.6, -length * 0.4, length, -length * 0.1);
+        ctx.lineWidth = w + 4; ctx.strokeStyle = OUTLINE; ctx.stroke();
+        ctx.lineWidth = w;     ctx.strokeStyle = FLAP;    ctx.stroke();
+        ctx.restore();
+      };
+      flap(-0.70, 15, 5.5);
+      flap(0.45, 12, 4.5);
+
+      // Fat crescent body: a thick round-capped arc reads as a banana far
+      // better than a filled two-arc sliver does at this size.
+      const body = (r, w, col, a0, a1) => {
+        ctx.beginPath(); ctx.arc(0, 0, r, a0, a1);
+        ctx.lineWidth = w; ctx.strokeStyle = col; ctx.stroke();
+      };
+      body(13, 13, OUTLINE, 0.08 * Math.PI, 0.92 * Math.PI);
+      body(13, 9,  SKIN,    0.08 * Math.PI, 0.92 * Math.PI);
+      body(15.4, 3, '#fff2a8', 0.26 * Math.PI, 0.74 * Math.PI);   // rim highlight
+
+      // Stalk stub at the far tip
       ctx.beginPath();
-      ctx.arc(0, 0, 13, 0.15 * Math.PI, 0.95 * Math.PI);
-      ctx.arc(0, 4, 10, 0.95 * Math.PI, 0.15 * Math.PI, true);
-      ctx.closePath(); ctx.fill();
-      ctx.strokeStyle = '#c9a520'; ctx.lineWidth = 1.6; ctx.stroke();
-      ctx.fillStyle = '#8b6a1c';
-      ctx.beginPath(); ctx.arc(-12, 2, 2.6, 0, TAU); ctx.fill();
-      ctx.beginPath(); ctx.arc(12, 2, 2.6, 0, TAU); ctx.fill();
+      ctx.moveTo(-12.2, 3.2); ctx.lineTo(-17.5, -3.4);
+      ctx.lineWidth = 7; ctx.strokeStyle = OUTLINE; ctx.stroke();
+      ctx.lineWidth = 3.6; ctx.strokeStyle = '#94701f'; ctx.stroke();
+
       ctx.restore();
     }
   },
